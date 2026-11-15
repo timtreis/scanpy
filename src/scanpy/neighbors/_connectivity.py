@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numba
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
@@ -98,6 +99,110 @@ def gauss[D: (NDArray[np.float32 | np.float64], CSRBase)](  # noqa: PLR0912
     return w
 
 
+# `_smooth_knn_dist`, `_membership_strengths` and the symmetrisation in `umap` below are ported from
+# umap-learn 0.6, `umap/umap_.py` (`smooth_knn_dist`, `compute_membership_strengths` and
+# `fuzzy_simplicial_set`), Copyright (c) 2017, Leland McInnes, BSD 3-Clause License
+# (https://github.com/lmcinnes/umap/blob/master/LICENSE.txt).
+# They keep its numba options so results stay bit-identical; umap-learn's versions are not
+# disk-cached and are recompiled in every session.
+_UMAP_FASTMATH = {"nsz", "arcp", "contract", "afn", "reassoc"}
+_FLOATMAX = np.finfo(np.float32).max
+
+
+@numba.njit(  # noqa: TID251 (fau's njit takes no `fastmath`/`locals`, needed to match umap-learn bit for bit)
+    locals={
+        "psum": numba.types.float32,
+        "lo": numba.types.float32,
+        "mid": numba.types.float32,
+        "hi": numba.types.float32,
+    },
+    parallel=True,
+    fastmath=_UMAP_FASTMATH,
+    cache=True,
+)
+def _smooth_knn_dist(distances, k, local_connectivity):  # noqa: PLR0912
+    n_iter = 64
+    target = np.log2(k)
+    rho = np.zeros(distances.shape[0], dtype=np.float32)
+    result = np.zeros(distances.shape[0], dtype=np.float32)
+    flat_distances = distances.ravel()
+    finite_distances = flat_distances[np.isfinite(flat_distances)]
+    mean_distances = np.mean(finite_distances) if finite_distances.shape[0] > 0 else 0.0
+    for i in numba.prange(distances.shape[0]):
+        lo = 0.0
+        hi = _FLOATMAX
+        mid = 1.0
+        ith_distances = distances[i]
+        finite_ith_distances = ith_distances[np.isfinite(ith_distances)]
+        non_zero_dists = finite_ith_distances[finite_ith_distances > 0.0]
+        if non_zero_dists.shape[0] >= local_connectivity:
+            index = int(np.floor(local_connectivity))
+            interpolation = local_connectivity - index
+            if index > 0:
+                rho[i] = non_zero_dists[index - 1]
+                if interpolation > 1e-5:
+                    rho[i] += interpolation * (
+                        non_zero_dists[index] - non_zero_dists[index - 1]
+                    )
+            else:
+                rho[i] = interpolation * non_zero_dists[0]
+        elif non_zero_dists.shape[0] > 0:
+            rho[i] = np.max(non_zero_dists)
+        for _ in range(n_iter):
+            psum = 0.0
+            for j in range(1, distances.shape[1]):
+                d = distances[i, j] - rho[i]
+                if d > 0:
+                    psum += np.exp(-(d / mid))
+                else:
+                    psum += 1.0
+            if np.fabs(psum - target) < 1e-5:
+                break
+            if psum > target:
+                hi = mid
+                mid = (lo + hi) / 2.0
+            else:
+                lo = mid
+                if hi >= _FLOATMAX:
+                    mid *= 2
+                else:
+                    mid = (lo + hi) / 2.0
+        result[i] = mid
+        if rho[i] > 0.0:
+            mean_ith_distances = np.mean(finite_ith_distances)
+            result[i] = max(result[i], 1e-3 * mean_ith_distances)
+        elif result[i] < 1e-3 * mean_distances:
+            result[i] = 1e-3 * mean_distances
+    return result, rho
+
+
+@numba.njit(  # noqa: TID251 (fau's njit takes no `fastmath`/`locals`, needed to match umap-learn bit for bit)
+    locals={
+        "knn_dists": numba.types.float32[:, ::1],
+        "sigmas": numba.types.float32[::1],
+        "rhos": numba.types.float32[::1],
+        "val": numba.types.float32,
+    },
+    parallel=True,
+    fastmath=_UMAP_FASTMATH,
+    cache=True,
+)
+def _membership_strengths(knn_indices, knn_dists, sigmas, rhos):
+    """Membership strength of each kNN edge; 0 for self and for missing (-1) neighbours."""
+    n_samples, n_neighbors = knn_indices.shape
+    vals = np.zeros(knn_indices.shape, dtype=np.float32)
+    for i in numba.prange(n_samples):
+        for j in range(n_neighbors):
+            if knn_indices[i, j] == -1 or knn_indices[i, j] == i:
+                continue
+            if knn_dists[i, j] - rhos[i] <= 0.0 or sigmas[i] == 0.0:
+                val = 1.0
+            else:
+                val = np.exp(-((knn_dists[i, j] - rhos[i]) / (sigmas[i])))
+            vals[i, j] = val
+    return vals
+
+
 def umap(
     knn_indices: NDArray[np.int32 | np.int64],
     knn_dists: NDArray[np.float32 | np.float64],
@@ -107,7 +212,7 @@ def umap(
     set_op_mix_ratio: float = 1.0,
     local_connectivity: float = 1.0,
 ) -> CSRBase:
-    """Wrap for `umap.fuzzy_simplicial_set` :cite:p:`McInnes2018`.
+    """Compute UMAP connectivities, as `umap.fuzzy_simplicial_set` :cite:p:`McInnes2018`.
 
     Given a set of data X, a neighborhood size, and a measure of distance
     compute the fuzzy simplicial set (here represented as a fuzzy graph in
@@ -115,25 +220,38 @@ def umap(
     locally approximating geodesic distance at each point, creating a fuzzy
     simplicial set for each such point, and then combining all the local
     fuzzy simplicial sets into a global one via a fuzzy union.
+
+    Re-implemented with a disk-cacheable kernel: umap-learn's is recompiled in every session.
     """
-    from umap.umap_ import fuzzy_simplicial_set
-
-    x = sparse.coo_matrix((n_obs, 1))
-    connectivities, _sigmas, _rhos = fuzzy_simplicial_set(
-        x,
-        n_neighbors,
-        None,
-        None,
-        # umap ≥0.6 requires C-contiguous arrays
-        knn_indices=np.ascontiguousarray(knn_indices),
-        knn_dists=np.ascontiguousarray(knn_dists),
-        set_op_mix_ratio=set_op_mix_ratio,
-        local_connectivity=local_connectivity,
-        # with precomputed kNNs, this only selects a faster kernel with identical results
-        compatibility_layout=False,
+    knn_indices = np.ascontiguousarray(knn_indices)
+    knn_dists = np.ascontiguousarray(knn_dists, dtype=np.float32)
+    sigmas, rhos = _smooth_knn_dist(
+        knn_dists, float(n_neighbors), float(local_connectivity)
     )
-
-    return connectivities.tocsr()
+    vals = _membership_strengths(knn_indices, knn_dists, sigmas, rhos)
+    k = knn_indices.shape[1]
+    graph = sparse.csr_matrix(  # noqa: TID251 (umap-learn builds this class; `+`/`multiply` below rely on its semantics)
+        (
+            vals.ravel(),
+            np.maximum(knn_indices, 0).ravel(),
+            np.arange(0, n_obs * k + 1, k),
+        ),
+        shape=(n_obs, n_obs),
+    )
+    graph.sum_duplicates()
+    graph.eliminate_zeros()
+    transpose = graph.T.tocsr()
+    prod = graph.multiply(transpose)
+    if set_op_mix_ratio == 1.0:
+        result = graph + transpose - prod
+    else:
+        result = (
+            set_op_mix_ratio * (graph + transpose - prod)
+            + (1.0 - set_op_mix_ratio) * prod
+        )
+    result = result.tocsr()
+    result.eliminate_zeros()
+    return result
 
 
 def jaccard(

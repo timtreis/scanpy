@@ -1,0 +1,1 @@
+Speed up the first {func}`~scanpy.pp.neighbors` call in each session. The UMAP connectivities are now computed by numba kernels ported from umap-learn 0.6, which numba caches on disk, while umap-learn's own kernels are compiled again in every session. Results are identical to umap-learn's {smaller}`T Treis`
