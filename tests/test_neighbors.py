@@ -498,3 +498,28 @@ def test_indices_distances_rect_matrix_padded() -> None:
 
     np.testing.assert_array_equal(indices, [[2, 0], [2, 3], [3, 0]])
     np.testing.assert_array_equal(distances, [[1, 2], [1, 2], [1, 4]])
+
+
+def test_fit_transform_skips_index_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynndescent import PyNNDescentTransformer
+
+    from scanpy.neighbors._common import _fit_transform
+
+    x = np.random.default_rng(0).normal(size=(3000, 10)).astype(np.float32)
+    kw = dict(n_neighbors=10, random_state=0, n_jobs=1)
+    expected = PyNNDescentTransformer(**kw).fit_transform(x)
+
+    calls: list[bool] = []
+    orig = PyNNDescentTransformer.fit
+
+    def fit(self, x, compress_index=True):  # noqa: FBT002
+        calls.append(compress_index)
+        return orig(self, x, compress_index=compress_index)
+
+    monkeypatch.setattr(PyNNDescentTransformer, "fit", fit)
+    actual = _fit_transform(PyNNDescentTransformer(**kw), x, discarded=True)
+    assert calls == [False]  # recognised as pynndescent's transformer
+    assert (actual != expected).nnz == 0
+    np.testing.assert_array_equal(actual.indices, expected.indices)

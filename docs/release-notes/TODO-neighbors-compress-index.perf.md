@@ -1,0 +1,1 @@
+Speed up {func}`~scanpy.pp.neighbors` with the default pynndescent transformer. Scanpy now fits it with `compress_index=False`, which skips building the search index that pynndescent prepares for later queries and that Scanpy discards. The kNN graph is the same {smaller}`T Treis`

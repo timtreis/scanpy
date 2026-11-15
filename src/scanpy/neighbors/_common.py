@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -146,6 +147,26 @@ def _remove_self_column(
         msg = "The first neighbor should be the cell itself."
         raise AssertionError(msg)
     return indices[:, 1:], distances[:, 1:]
+
+
+def _fit_transform(transformer: KnnTransformerLike, x, /, *, discarded: bool):
+    """``transformer.fit_transform(x)``, skipping work whose result Scanpy throws away.
+
+    For a transformer Scanpy created (``discarded``), pynndescent’s ``fit_transform``
+    would end by compressing the index, i.e. building a search tree and graph for
+    queries, then garbage-collecting. The k-NN graph is the same without that.
+    `PyNNDescentTransformer.fit`’s `compress_index` exists since pynndescent 0.5,
+    so the `pynndescent>=0.5.13` floor covers it.
+    """
+    # if pynndescent isn’t imported, `transformer` can’t be one of its instances
+    pynnd = sys.modules.get("pynndescent")
+    if (
+        discarded
+        and pynnd is not None
+        and isinstance(transformer, pynnd.PyNNDescentTransformer)
+    ):
+        return transformer.fit(x, compress_index=False).transform(None)
+    return transformer.fit_transform(x)
 
 
 def _get_sparse_matrix_from_indices_distances(
