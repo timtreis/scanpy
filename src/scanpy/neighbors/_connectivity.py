@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
@@ -118,12 +116,7 @@ def umap(
     simplicial set for each such point, and then combining all the local
     fuzzy simplicial sets into a global one via a fuzzy union.
     """
-    with warnings.catch_warnings():
-        # umap 0.5.0
-        warnings.filterwarnings("ignore", message=r"Tensorflow not installed")
-        from umap.umap_ import fuzzy_simplicial_set
-
-    from ..tools._umap import _umap_layout_kw
+    from umap.umap_ import fuzzy_simplicial_set
 
     x = sparse.coo_matrix((n_obs, 1))
     connectivities, _sigmas, _rhos = fuzzy_simplicial_set(
@@ -137,7 +130,7 @@ def umap(
         set_op_mix_ratio=set_op_mix_ratio,
         local_connectivity=local_connectivity,
         # with precomputed kNNs, this only selects a faster kernel with identical results
-        **_umap_layout_kw(compatibility_layout=False),
+        compatibility_layout=False,
     )
 
     return connectivities.tocsr()

@@ -244,7 +244,7 @@ class Ingest:
     def _init_umap(self, adata: AnnData, keys: _EmbeddingKeys) -> None:
         from umap import UMAP
 
-        from ._umap import _resolve_compatibility_layout, _umap_layout_kw
+        from ._umap import _resolve_compatibility_layout
 
         params = adata.uns[keys.uns]["params"]
         rng = self._get_rng(params)
@@ -253,7 +253,7 @@ class Ingest:
             params.get("compatibility_layout", True)
         )
         self._umap = UMAP(
-            **_umap_layout_kw(compatibility_layout=compat_layout),
+            compatibility_layout=compat_layout,
             metric=self._metric,
             random_state=_legacy_random_state(rng),
             # the compatibility pipeline is only reproducible single-threaded
