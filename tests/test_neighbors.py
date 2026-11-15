@@ -498,3 +498,23 @@ def test_indices_distances_rect_matrix_padded() -> None:
 
     np.testing.assert_array_equal(indices, [[2, 0], [2, 3], [3, 0]])
     np.testing.assert_array_equal(distances, [[1, 2], [1, 2], [1, 4]])
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_pynndescent_cache_bit_identical(
+    metric: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pynndescent.pynndescent_ as p
+    from pynndescent import NNDescent
+
+    from scanpy.neighbors._backends._pynndescent_cache import _stock, enable
+
+    if not enable():
+        pytest.skip("untested pynndescent version: stock code is used")
+    x = np.random.default_rng(0).normal(size=(5000, 20)).astype(np.float32)
+    kw = dict(n_neighbors=15, metric=metric, random_state=0, n_jobs=1)
+    patched = NNDescent(x, **kw).neighbor_graph
+    monkeypatch.setattr(p, "nn_descent", _stock()["nn_descent"])
+    stock = NNDescent(x, **kw).neighbor_graph
+    np.testing.assert_array_equal(patched[0], stock[0])
+    np.testing.assert_array_equal(patched[1], stock[1])

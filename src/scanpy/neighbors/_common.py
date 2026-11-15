@@ -68,6 +68,9 @@ def _make_transformer(
     if transformer is None or transformer == "pynndescent":
         from pynndescent import PyNNDescentTransformer
 
+        from ._backends._pynndescent_cache import enable
+
+        enable()  # disk-cache pynndescent's kernels, otherwise recompiled every session
         kwds["metric_kwds"] = dict(kwds.pop("metric_params"))  # needs to be cloneable
         if transformer is None:
             # Use defaults from UMAP’s `nearest_neighbors` function
