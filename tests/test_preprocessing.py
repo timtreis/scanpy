@@ -756,6 +756,33 @@ def test_filter_cells(array_type, arg: str) -> None:
     assert_allclose(adata_casted.X, adata.X, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("by_name", [False, True], ids=["array", "obs_column"])
+def test_filter_cells_mask(*, by_name: bool) -> None:
+    from inspect import signature
+
+    adata = pbmc68k_reduced()
+    adata.X = adata.raw.X.copy()  # `X` must own its buffers to be compacted
+    keep = np.random.default_rng(0).random(adata.n_obs) > 0.3
+    adata.obs["keep"] = keep
+    expected = adata[keep].copy()
+    copied = sc.pp.filter_cells(adata, mask=keep, copy=True)
+    assert_equal(copied, expected)
+    with pytest.raises(TypeError, match=r"can't be combined with `out`"):
+        sc.pp.filter_cells(adata, mask=keep, out=True)
+    x = adata.X
+    sc.pp.filter_cells(adata, mask="keep" if by_name else keep)
+    assert_equal(adata, expected)
+    # with an anndata that supports it, the CSR `X` is compacted in place, not copied
+    compacts = "compact" in signature(AnnData._inplace_subset_obs).parameters
+    assert (adata.X is x) == compacts
+    with pytest.raises(ValueError, match=r"exactly one"):
+        sc.pp.filter_cells(adata, mask=keep, min_genes=1)
+    with pytest.raises(ValueError, match=r"shape of the mask"):
+        sc.pp.filter_cells(adata, mask=np.ones(3, bool))
+    with pytest.raises(ValueError, match=r"must be boolean"):
+        sc.pp.filter_cells(adata, mask=np.ones(adata.n_obs))
+
+
 @needs.jax
 @pytest.mark.skipif(
     as_dense_jax_array is None, reason="anndata version doesn’t support jax arrays"
