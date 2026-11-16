@@ -1,0 +1,1 @@
+{func}`~scanpy.pp.highly_variable_genes` with `n_top_genes` warns instead of raising an error when no gene of a batch has a normalized dispersion, e.g. in a batch with a single cell {smaller}`T Treis`

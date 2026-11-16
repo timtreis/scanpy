@@ -148,7 +148,8 @@ class Settings(scverse_misc.Settings):
     With `False`, some functions take faster paths that sum in a different order or
     precision, so results can differ in the last bits. They are still reproducible,
     and don't depend on the number of threads.
-    Affected: :func:`~scanpy.pp.calculate_qc_metrics` (float data).
+    Affected: :func:`~scanpy.pp.calculate_qc_metrics` (float data) and
+    :func:`~scanpy.pp.highly_variable_genes` (with `batch_key`, CSR data).
     """
 
     categories_to_ignore: Container[str] = frozenset({

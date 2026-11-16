@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import warnings
 from dataclasses import dataclass
 from functools import singledispatch
@@ -12,6 +13,7 @@ import pandas as pd
 from anndata import AnnData
 from array_api_compat import array_namespace
 from fast_array_utils import stats
+from fast_array_utils.numba import njit
 from fast_array_utils.types import HasArrayNamespace
 from scverse_misc import Deprecation, deprecated_arg
 
@@ -26,14 +28,22 @@ from .._utils import (
     raise_if_dask_feature_axis_chunked,
     sanitize_anndata,
 )
+from .._utils._numba import (
+    FLOAT_DTYPES,
+    N_REDUCE_CHUNKS,
+    _chunk_bounds,
+    _is_numba_csr,
+    has_canonical_format,
+)
 from ..get import aggregate
+from ..get._kernels import _group_layout
 from ..get._out import _legacy_out
 from ..get._use import _get_arr, _get_vec, _ref_arg, _resolve_layer
 from ._distributed import materialize_as_ndarray
 from ._simple import filter_genes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
     from typing import Concatenate, Literal, Unpack
 
     from numpy.typing import NDArray
@@ -405,10 +415,7 @@ def _highly_variable_genes_single_batch(
     `highly_variable`, `means`, `dispersions`, and `dispersions_norm`.
 
     """
-    cutoff = kwargs["cutoff"]
     flavor = kwargs["flavor"]
-    n_bins = kwargs["n_bins"]
-
     x = _get_arr(adata, use, layer=layer)
 
     # Filter to genes that are expressed
@@ -419,8 +426,7 @@ def _highly_variable_genes_single_batch(
     else:
         filt = np.ones(x.shape[1], dtype=bool)
 
-    n_removed = np.sum(~filt)
-    if n_removed:
+    if not filt.all():
         x = x[:, filt].copy()
 
     if flavor == "seurat":
@@ -437,6 +443,21 @@ def _highly_variable_genes_single_batch(
             x = np.expm1(x)
 
     mean, var = materialize_as_ndarray(stats.mean_var(x, axis=0, correction=1))
+    return _hvg_df_from_moments(mean, var, filt, adata.var_names, **kwargs)
+
+
+def _hvg_df_from_moments(
+    mean: NDArray[np.float64],
+    var: NDArray[np.float64],
+    filt: NDArray[np.bool],
+    var_names: pd.Index,
+    **kwargs: Unpack[HvgArgs],
+) -> pd.DataFrame:
+    """Dispersion-based HVG table from per-gene moments of the genes in `filt`."""
+    cutoff = kwargs["cutoff"]
+    flavor = kwargs["flavor"]
+    n_bins = kwargs["n_bins"]
+    n_removed = np.sum(~filt)
     # now actually compute the dispersion
     # JAX arrays are immutable, so in-place assignment (mean[mean == 0] = ...)
     # fails; np.where allocates a fresh array instead
@@ -457,13 +478,13 @@ def _highly_variable_genes_single_batch(
     # actually do the normalization
     df["dispersions_norm"] = (df["dispersions"] - disp_stats["avg"]) / disp_stats["dev"]
     df["highly_variable"] = _subset_genes(
-        adata[:, filt],
+        int(filt.sum()),
         mean=mean,
         dispersion_norm=df["dispersions_norm"].to_numpy(),
         cutoff=cutoff,
     )
 
-    df.index = adata[:, filt].var_names
+    df.index = var_names[filt]
 
     if n_removed > 0:
         # Add 0 values for genes that were filtered out
@@ -472,7 +493,7 @@ def _highly_variable_genes_single_batch(
             columns=df.columns,
         )
         missing_hvg["highly_variable"] = missing_hvg["highly_variable"].astype(bool)
-        missing_hvg.index = adata.var_names[~filt]
+        missing_hvg.index = var_names[~filt]
         # restore the original gene order by position: var_names may be duplicated
         order = np.argsort(np.r_[np.flatnonzero(filt), np.flatnonzero(~filt)])
         df = pd.concat([df, missing_hvg]).iloc[order]
@@ -543,7 +564,7 @@ def _mad(a):
 
 
 def _subset_genes(
-    adata: AnnData,
+    n_vars: int,
     *,
     mean: NDArray[np.float64] | DaskArray,
     dispersion_norm: NDArray[np.float64] | DaskArray,
@@ -556,9 +577,9 @@ def _subset_genes(
     n_top_genes = cutoff
     del cutoff
 
-    if n_top_genes > adata.n_vars:
+    if n_top_genes > n_vars:
         logg.info("`n_top_genes` > `adata.n_var`, returning all genes.")
-        n_top_genes = adata.n_vars
+        n_top_genes = n_vars
     disp_cut_off = _nth_highest(dispersion_norm, n_top_genes)
     logg.debug(
         f"the {n_top_genes} top genes correspond to a "
@@ -576,11 +597,285 @@ def _nth_highest(x: NDArray[np.float64] | DaskArray, n: int) -> float | DaskArra
         )
         warn(msg, UserWarning)
         n = x.size
+    if n == 0:  # e.g. a single-cell batch: no gene passes
+        return np.inf
     if isinstance(x, DaskArray):
         return x.topk(n)[-1]
     # interestingly, np.argpartition is slightly slower
     x[::-1].sort()
     return x[n - 1]
+
+
+def _hvg_batched_csr(
+    x: CSRBase,
+    batch_info: pd.Categorical,
+    var_names: pd.Index,
+    *,
+    log_base: np.floating | None,
+    reference: bool,
+    **kwargs: Unpack[HvgArgs],
+) -> Generator[pd.DataFrame]:
+    """Per-batch HVG tables without subsetting `x` per batch.
+
+    With `reference`, the tables are bit-identical to running `_highly_variable_genes_single_batch`
+    with `filter_unexpressed_genes=True` on each batch (see :func:`_batch_moments_reference`).
+    Without, they come from one fused pass and agree to rounding (see :func:`_batch_moments_fast`).
+    `log_base` is the log of `adata.uns["log1p"]["base"]`, for seurat's `expm1`.
+    """
+    if not has_canonical_format(x):
+        # The per-batch path's `filter_genes` (`x > 0`) sums each batch's duplicates in place
+        # first, with scipy, row by row. Do that on a copy: the input isn't modified.
+        x = x.copy()
+        x.sum_duplicates()
+    # cells with a missing batch are dropped
+    rows, group_ptr, _ = _group_layout(batch_info.codes, len(batch_info.categories))
+    moments = _batch_moments_reference if reference else _batch_moments_fast
+    for mean, var, filt in moments(
+        x,
+        batch_info.codes,
+        rows,
+        group_ptr,
+        expm1=kwargs["flavor"] == "seurat",
+        log_base=log_base,
+    ):
+        yield _hvg_df_from_moments(mean[filt], var[filt], filt, var_names, **kwargs)
+
+
+def _batch_moments_fast(
+    x: CSRBase,
+    codes: NDArray[np.integer],
+    rows: NDArray[np.intp],
+    group_ptr: NDArray[np.int64],
+    *,
+    expm1: bool,
+    log_base: np.floating | None,
+) -> Generator[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool]]]:
+    """Per batch: mean, variance (``dof=1``) and genes expressed in it, from one pass over `x`.
+
+    Sums of squares in float64 and numba's `expm1`: agrees with the per-batch path to rounding.
+    """
+    n_batches = group_ptr.shape[0] - 1
+    sums, sq_sums, n_pos = _grouped_moments_csr(
+        x.indptr,
+        x.indices,
+        x.data,
+        rows,
+        codes,
+        n_batches,
+        x.shape[1],
+        expm1,
+        1.0 if log_base is None else float(log_base),
+        _chunk_bounds(rows.shape[0], N_REDUCE_CHUNKS),
+    )
+    for b, n in enumerate(np.diff(group_ptr)):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean = sums[b] / n
+            # no Bessel correction for a single cell, as fast-array-utils' `mean_var`
+            var = (sq_sums[b] / n - mean**2) * (n / (n - 1) if n > 1 else 1.0)
+        yield mean, var, n_pos[b] > 0
+
+
+def _batch_moments_reference(
+    x: CSRBase,
+    codes: NDArray[np.integer],  # noqa: ARG001
+    rows: NDArray[np.intp],
+    group_ptr: NDArray[np.int64],
+    *,
+    expm1: bool,
+    log_base: np.floating | None,
+) -> Generator[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool]]]:
+    """Per batch: mean, variance (``dof=1``) and genes expressed in it, as the per-batch path.
+
+    `x` must be canonical. The per-batch path (`_highly_variable_genes_single_batch` on
+    `adata[batch_mask].copy()`) computes, on the batch's rows in their order:
+    `filt` from `filter_genes(x, min_cells=1)` (the columns with a value > 0), then
+    `x[:, filt]`, for seurat ``x *= np.log(base)`` and ``np.expm1(x)`` on the stored values, and
+    fast-array-utils' `stats.mean_var(x, axis=0, correction=1)`. Here, the same values reach
+    :func:`_mean_var_minor_rows`, which repeats fast-array-utils' kernel for those rows:
+
+    - The transformed values are numpy's own `multiply` and `expm1` on the batch's stored values
+      (gathered in their order), applied in chunks across threads. Both are elementwise, so each
+      value gets the same bits as from one call on the batch matrix.
+    - Each column is accumulated on its own, so leaving out the columns not in `filt` (whose
+      values the per-batch path drops) changes nothing in the others.
+    """
+    lengths = np.diff(x.indptr)
+    buf = None
+    if expm1:  # one buffer for the largest batch's values
+        nnz = [lengths[rows[a:b]].sum() for a, b in itertools.pairwise(group_ptr)]
+        buf = np.empty(max(nnz, default=0), dtype=x.dtype)
+    for a, b in itertools.pairwise(group_ptr):
+        rows_b = rows[a:b]
+        n = int(b - a)
+        if n == 0:  # an unused category: no genes are expressed
+            zeros = np.zeros(x.shape[1])
+            yield zeros, zeros.copy(), np.zeros(x.shape[1], dtype=bool)
+            continue
+        if expm1:
+            starts = np.zeros(n + 1, dtype=np.int64)
+            np.cumsum(lengths[rows_b], out=starts[1:])
+            vals = buf[: starts[-1]]
+            _gather_rows(x.indptr, x.data, rows_b, starts, vals)
+            _expm1_threaded(vals, log_base)
+        else:
+            vals, starts = x.data, x.indptr[rows_b].astype(np.int64)
+        mean, var, n_pos = _mean_var_minor_rows(
+            x.indptr,
+            x.indices,
+            x.data,
+            vals,
+            starts,
+            rows_b,
+            x.shape[1],
+            # as fast-array-utils' `_sparse_mean_var`, on each call
+            numba.get_num_threads(),
+        )
+        if n != 1:  # as fast-array-utils' `mean_var` with `correction=1`
+            var *= n / (n - 1)
+        yield mean, var, n_pos > 0
+
+
+def _expm1_threaded(
+    x: NDArray[np.floating], factor: np.floating | None, chunk: int = 1 << 20
+) -> None:
+    """In place, ``x *= factor`` (if given), then ``np.expm1(x)``, in chunks across threads.
+
+    numpy's ufuncs release the GIL but run on one core. They are elementwise, so the result
+    doesn't depend on the chunks.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    err = np.geterr()  # `np.errstate` is per thread
+
+    def work(start: int) -> None:
+        part = x[start : start + chunk]
+        with np.errstate(**err):
+            if factor is not None:
+                part *= factor  # as scipy's `x *= factor`: on `x.data`, with numpy's casting
+            np.expm1(part, out=part)
+
+    with ThreadPoolExecutor(numba.get_num_threads()) as pool:
+        # consume the iterator to surface exceptions
+        list(pool.map(work, range(0, x.shape[0], chunk)))
+
+
+@njit
+def _gather_rows(
+    indptr: NDArray[np.integer],
+    data: NDArray[np.number],
+    rows: NDArray[np.intp],
+    starts: NDArray[np.int64],
+    out: NDArray[np.number],
+) -> None:
+    """Copy the stored values of `rows`, in order, to ``out[starts[r]:starts[r + 1]]``."""
+    for r in numba.prange(rows.shape[0]):
+        src = indptr[rows[r]]
+        for k in range(starts[r + 1] - starts[r]):
+            out[starts[r] + k] = data[src + k]
+
+
+# Why this is bit-identical to fast-array-utils' `stats.mean_var(x_b, axis=0)` for the CSR matrix
+# `x_b` of the rows `rows` (in that order) with the values `vals`: it is that function's kernel,
+# `sparse_mean_var_minor_axis` (fast_array_utils/stats/_mean_var.py), with only the row lookup
+# changed. Thread slot `i` of `n_threads` (`numba.get_num_threads()` when it is called) adds the
+# rows ``i, i + n_threads, ...`` of `x_b` in order into its own float64 partials (``value * value``
+# in the values' dtype), the slots are added up in slot order for each column, then divided by the
+# number of rows. The same statements in the same order give the same bits whether the slots run
+# in parallel or not. `n_pos` (the values > 0 of `raw`, i.e. of `x` before `expm1`) is an integer
+# count, exact in any order.
+@njit
+def _mean_var_minor_rows(  # noqa: PLR0917
+    indptr: NDArray[np.integer],
+    indices: NDArray[np.integer],
+    raw: NDArray[np.number],
+    vals: NDArray[np.floating],
+    starts: NDArray[np.int64],
+    rows: NDArray[np.intp],
+    minor_len: int,
+    n_threads: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    major_len = rows.shape[0]
+    sums = np.zeros((n_threads, minor_len))
+    squared_sums = np.zeros((n_threads, minor_len))
+    pos = np.zeros((n_threads, minor_len), dtype=np.int64)
+    means = np.zeros(minor_len)
+    variances = np.zeros(minor_len)
+    n_pos = np.zeros(minor_len, dtype=np.int64)
+    for i in numba.prange(n_threads):
+        for r in range(i, major_len, n_threads):
+            row = rows[r]
+            shift = starts[r] - indptr[row]  # row `r`'s values are at `vals[shift + j]`
+            for j in range(indptr[row], indptr[row + 1]):
+                minor_index = indices[j]
+                pos[i, minor_index] += raw[j] > 0
+                value = vals[shift + j]
+                sums[i, minor_index] += value
+                squared_sums[i, minor_index] += value * value
+    for c in numba.prange(minor_len):
+        total = sums[:, c].sum()
+        means[c] = total / major_len
+        variances[c] = squared_sums[:, c].sum() / major_len - (total / major_len) ** 2
+        n_pos[c] = pos[:, c].sum()
+    return means, variances, n_pos
+
+
+@njit
+def _grouped_moments_csr(  # noqa: PLR0912, PLR0917
+    indptr: NDArray[np.integer],
+    indices: NDArray[np.integer],
+    data: NDArray[np.number],
+    rows: NDArray[np.intp],
+    group: NDArray[np.integer],
+    n_groups: int,
+    n_cols: int,
+    expm1: bool,  # noqa: FBT001
+    scale: float,
+    bounds: NDArray[np.int64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    """Per (group, column) sum and sum of squares of `x` (or `expm1(scale * x)`) and count of `x > 0`.
+
+    `rows` lists the rows sorted by `group`, and is cut into the pieces ``bounds[t]:bounds[t + 1]``
+    (see :func:`~scanpy._utils._numba._chunk_bounds`; as in Harmony's `_joint_stats`). A group is
+    written directly only by the piece it starts strictly inside; each piece's first group goes to
+    that piece's buffer, and the buffers are added in piece order afterwards. Scratch is
+    `n_pieces * n_cols` per statistic, and with pieces fixed by the shape, results don't depend on
+    the number of threads.
+    """
+    n_chunks = bounds.shape[0] - 1
+    sums = np.zeros((n_groups, n_cols))
+    sq_sums = np.zeros((n_groups, n_cols))
+    n_pos = np.zeros((n_groups, n_cols), dtype=np.int64)
+    edge_s = np.zeros((n_chunks, n_cols))
+    edge_q = np.zeros((n_chunks, n_cols))
+    edge_n = np.zeros((n_chunks, n_cols), dtype=np.int64)
+    first = np.full(n_chunks, -1, dtype=np.int64)
+    for t in range(n_chunks):
+        if bounds[t + 1] > bounds[t]:
+            first[t] = group[rows[bounds[t]]]
+    for t in numba.prange(n_chunks):
+        for r in range(bounds[t], bounds[t + 1]):
+            i = rows[r]
+            g = group[i]
+            # pick the destination rows once per row, so the inner loop is branch-free
+            if g == first[t]:
+                dn, ds, dq = edge_n[t], edge_s[t], edge_q[t]
+            else:
+                dn, ds, dq = n_pos[g], sums[g], sq_sums[g]
+            for k in range(indptr[i], indptr[i + 1]):
+                j = indices[k]
+                v = np.float64(data[k])
+                dn[j] += v > 0
+                if expm1:
+                    v = np.expm1(v * scale)
+                ds[j] += v
+                dq[j] += v * v
+    for t in range(n_chunks):  # in piece order, after any direct writes to the group
+        g = first[t]
+        if g >= 0:
+            sums[g] += edge_s[t]
+            sq_sums[g] += edge_q[t]
+            n_pos[g] += edge_n[t]
+    return sums, sq_sums, n_pos
 
 
 def _per_batch_func[R, **P](
@@ -612,18 +907,32 @@ def _highly_variable_genes_batched(
 
         func = delayed(_per_batch_func)
 
-    dfs = (
-        func(
-            _highly_variable_genes_single_batch,
-            adata=adata,
-            batch_mask=np.asarray(batch_info == batch),
-            use=use,
-            layer=layer,
-            filter_unexpressed_genes=True,
+    reference = settings.reference_numerics
+    if _is_numba_csr(x) and (x.dtype in FLOAT_DTYPES or not reference):
+        # without a copy of each batch. seurat's dispersions are on expm1'd data:
+        # undo a non-natural log1p base too
+        base = adata.uns.get("log1p", {}).get("base")
+        dfs = _hvg_batched_csr(
+            x,
+            batch_info,
+            adata.var_names,
+            log_base=None if base is None else np.log(base),
+            reference=reference,
             **kwargs,
         )
-        for batch in batch_info.categories
-    )
+    else:
+        dfs = (
+            func(
+                _highly_variable_genes_single_batch,
+                adata=adata,
+                batch_mask=np.asarray(batch_info == batch),
+                use=use,
+                layer=layer,
+                filter_unexpressed_genes=True,
+                **kwargs,
+            )
+            for batch in batch_info.categories
+        )
 
     if is_dask:
         from dask import compute
