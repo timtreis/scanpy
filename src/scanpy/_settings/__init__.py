@@ -147,9 +147,11 @@ class Settings(scverse_misc.Settings):
     kernels were added.
     With `False`, some functions take faster paths that sum in a different order or
     precision, so results can differ in the last bits. They are still reproducible,
-    and don't depend on the number of threads.
-    Affected: :func:`~scanpy.pp.calculate_qc_metrics` (float data) and
-    :func:`~scanpy.pp.highly_variable_genes` (with `batch_key`, CSR data).
+    and don't depend on the number of threads except where noted (the CSR
+    `covariance_eigh` Gram uses BLAS `dsyrk`, which depends on it with MKL).
+    Affected: :func:`~scanpy.pp.calculate_qc_metrics` (float data),
+    :func:`~scanpy.pp.highly_variable_genes` (with `batch_key`, CSR data) and
+    :func:`~scanpy.pp.pca` (`svd_solver="covariance_eigh"`, CSR data).
     """
 
     categories_to_ignore: Container[str] = frozenset({

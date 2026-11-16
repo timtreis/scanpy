@@ -8,11 +8,12 @@ from anndata import AnnData
 from scverse_misc import Deprecation, deprecated_arg
 
 from ... import logging as logg
-from ..._compat import CSBase, DaskArray, warn
+from ..._compat import CSBase, CSRBase, DaskArray, warn
 from ..._docs import DEPR_KEY_ADDED, doc_out_multi, doc_rng, doc_use
 from ..._keys import _embedding_keys
 from ..._settings import Default, settings
 from ..._utils import _doc_params, get_literal_vals, is_backed_type
+from ..._utils._numba import _is_numba_dtype
 from ..._utils.random import _accepts_legacy_random_state, _legacy_random_state
 from ...get._out import _dest_key, _out_dests, _write_dests, deprecated_copy
 from ...get._uns import _ref_to_uns, _use_to_uns
@@ -30,7 +31,7 @@ from ._compat import _pca_compat_sparse
 if TYPE_CHECKING:
     from collections.abc import Container
     from collections.abc import Set as AbstractSet
-    from typing import LiteralString
+    from typing import LiteralString, TypeIs
 
     import dask_ml.decomposition as dmld
     import sklearn.decomposition as skld
@@ -212,6 +213,10 @@ def pca(  # noqa: PLR0912, PLR0913, PLR0915
         `'covariance_eigh'`
             Classic eigendecomposition of the covariance matrix, suited for tall-and-skinny matrices.
             With dask, array must be CSR or dense and chunked as `(N, adata.shape[1])`.
+            For in-memory CSR matrices, the covariance and projection are computed in parallel.
+            With :attr:`scanpy.settings.reference_numerics` (the default), the results are
+            bit-identical to sklearn's. With it off, the covariance is summed in float64,
+            so results can differ in the last bits.
         `'randomized'`
             Randomized algorithm from :cite:t:`Halko2009`.
             For *dask* arrays, this will use :func:`~dask.array.linalg.svd_compressed`.
@@ -330,7 +335,16 @@ def pca(  # noqa: PLR0912, PLR0913, PLR0915
 
     logg.info(f"    with {n_comps=}")
 
-    x = _get_arr(adata_comp, use, layer=layer, obsm=obsm)
+    # In-memory CSR `covariance_eigh` runs parallel kernels (`_kernels.py`) that read the selected
+    # columns straight from the full matrix, so the subset is never materialised.
+    eigh_sparse = svd_solver == "covariance_eigh" and zero_center and not chunked
+    cols = None
+    if mask_var is not None and eigh_sparse and not multi:
+        x_full = _get_arr(adata, use, layer=layer, obsm=obsm)
+        if _eigh_sparse_dtype(x_full):
+            x, cols = x_full, np.flatnonzero(np.asarray(mask_var))
+    if cols is None:
+        x = _get_arr(adata_comp, use, layer=layer, obsm=obsm)
     if is_backed_type(x) and (layer is not None or obsm is not None or use is not None):
         msg = f"PCA is not implemented for matrices of type {type(x)} from layers/obsm"
         raise NotImplementedError(msg)
@@ -371,7 +385,15 @@ def pca(  # noqa: PLR0912, PLR0913, PLR0915
             warn(msg, FutureWarning)
             x_pca, pca_ = _pca_compat_sparse(x, n_comps, solver=svd_solver, rng=rng)
         else:
-            if not isinstance(x, DaskArray):
+            if eigh_sparse and _eigh_sparse_dtype(x):
+                from ._kernels import PCAEighSparse, PCAEighSparseReference
+
+                pca_ = (
+                    PCAEighSparseReference
+                    if settings.reference_numerics
+                    else PCAEighSparse
+                )(n_components=n_comps, cols=cols)
+            elif not isinstance(x, DaskArray):
                 from sklearn.decomposition import PCA
 
                 svd_solver = _handle_sklearn_args(
@@ -559,3 +581,16 @@ def _handle_x_args[T: LiteralString](
         )
         warn(msg, UserWarning)
     return default
+
+
+def _eigh_sparse_dtype(x: object) -> TypeIs[CSRBase]:
+    """Whether `x` is CSR with a dtype the parallel `covariance_eigh` kernels handle.
+
+    With `settings.reference_numerics`, only sklearn's float32 and float64:
+    sklearn converts anything else to a float64 copy first.
+    """
+    if not isinstance(x, CSRBase):
+        return False
+    if settings.reference_numerics:
+        return x.dtype in {np.dtype(np.float32), np.dtype(np.float64)}
+    return x.dtype.kind != "b" and _is_numba_dtype(x.dtype)

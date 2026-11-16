@@ -71,6 +71,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "session-info2",
     "statsmodels>=0.14.5",
+    "threadpoolctl",
     "tqdm",
     "umap-learn>=0.5.12",
     "zarr>=3.2",
