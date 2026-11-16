@@ -1,0 +1,1 @@
+Add a private `python -m scanpy._warmup` command that runs small synthetic pipelines, so numba's disk cache holds Scanpy's compiled kernels before the first analysis in a new environment {smaller}`T Treis`
