@@ -345,7 +345,8 @@ def scale_array[A: _Array](
         x,
         std,
         op=truediv,
-        out=x if isinstance(x, np.ndarray | CSBase) else None,
+        # CSC: into new data, as always (writing into `x.data` would change matrices sharing it)
+        out=x if isinstance(x, np.ndarray | CSRBase) else None,
         axis=1,
     )
 

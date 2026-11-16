@@ -437,10 +437,35 @@ def log1p_array(
         x = x.astype(float) if not np.issubdtype(x.dtype, np.floating) else x.copy()
     elif not (np.issubdtype(x.dtype, np.floating) or np.issubdtype(x.dtype, complex)):
         x = x.astype(float)
+    if isinstance(x, np.ndarray) and x.flags.c_contiguous:
+        _log1p_threaded(x.reshape(-1), None if base is None else np.log(base))
+        return x
     np.log1p(x, out=x)
     if base is not None:
         np.divide(x, np.log(base), out=x)
     return x
+
+
+def _log1p_threaded(x: NDArray, divisor: float | None, chunk: int = 1 << 20) -> None:
+    """In-place `log1p` (divided by `divisor`) in chunks across threads.
+
+    numpy's SIMD ufuncs release the GIL but run on one core, which dominates `log1p`
+    on large sparse data. Uses as many threads as numba, like scanpy's kernels.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    err = np.geterr()  # `np.errstate` is per thread
+
+    def work(start: int) -> None:
+        part = x[start : start + chunk]
+        with np.errstate(**err):
+            np.log1p(part, out=part)
+            if divisor is not None:
+                np.divide(part, divisor, out=part)
+
+    with ThreadPoolExecutor(numba.get_num_threads()) as pool:
+        # consume the iterator to surface exceptions
+        list(pool.map(work, range(0, x.shape[0], chunk)))
 
 
 @_log1p.register(HasArrayNamespace)

@@ -231,6 +231,12 @@ def normalize_total(  # noqa: PLR0913
         call functions that trigger `.compute()` on the :class:`~dask.array.Array` if `exclude_highly_expressed`
         is `True`, or if `norm_factor` is written.
 
+    .. note::
+        When the normalized matrix is written back to where it was read from,
+        the values are written into its existing buffer where possible, for dense and CSR
+        matrices alike (as :func:`~scanpy.pp.log1p` does).
+        Other arrays that share that buffer, e.g. a layer assigned without copying, change too.
+
     Parameters
     ----------
     adata

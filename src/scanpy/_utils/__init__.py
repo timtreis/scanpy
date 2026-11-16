@@ -37,7 +37,7 @@ from fast_array_utils.types import HasArrayNamespace
 
 from .. import logging as logg
 from .._compat import CSBase, DaskArray, SpBase, warn
-from ._numba import _numba_thread_limit
+from ._numba import FLOAT_DTYPES, _numba_thread_limit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, KeysView
@@ -697,17 +697,49 @@ def _(
     if x.format == "csr":
         indices = x.indices
         indptr = x.indptr
+        scale = np.asarray(scaling_array).ravel()
+        # numba's serial fallback raises on division by zero where numpy gives inf;
+        # numba doesn't bounds-check, where numpy raises on a scale of the wrong length
+        if (
+            x.data.dtype in FLOAT_DTYPES
+            and np.result_type(x.data, scale) == x.data.dtype
+            and scale.shape[0] == x.shape[0 if row_scale else 1]
+            and not (op is truediv and (scale == 0).any())
+        ):
+            from ._numba import _scale_csr
+
+            # in parallel and without the `np.repeat` temporary. With `out` (i.e. `x`), into `x.data`
+            # itself, as `log1p` does: other matrices sharing that buffer see the new values too
+            data = (
+                x.data
+                if out is not None and x.data.flags.writeable
+                else np.empty_like(x.data)
+            )
+            _scale_csr(
+                x.data,
+                indptr,
+                indices,
+                scale.astype(data.dtype),
+                row_scale,
+                op is truediv,
+                data,
+            )
+            if out is not None:
+                x.data = data
+                return x
+            return type(x)((data, indices.copy(), indptr.copy()), shape=x.shape)
         if out is not None:
             x.data = new_data_op(x)
             return x
         return type(x)((new_data_op(x), indices.copy(), indptr.copy()), shape=x.shape)
+    # the CSR transpose shares `x`'s buffers: write into them only if asked to (`out`)
     transposed = x.T
     return axis_mul_or_truediv(
         transposed,
         scaling_array,
         op=op,
         axis=1 - axis,
-        out=transposed,
+        out=None if out is None else transposed,
         allow_divide_by_zero=allow_divide_by_zero,
     ).T
 

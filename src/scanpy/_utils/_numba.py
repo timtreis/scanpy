@@ -158,6 +158,23 @@ def has_canonical_format(x: CSBase) -> bool:
     return flag
 
 
+@njit
+def _scale_csr(  # noqa: PLR0917
+    data: NDArray[np.floating],
+    indptr: NDArray[np.integer],
+    indices: NDArray[np.integer],
+    scale: NDArray[np.floating],
+    by_row: bool,  # noqa: FBT001
+    divide: bool,  # noqa: FBT001
+    out: NDArray[np.floating],
+) -> None:
+    """Multiply or divide each stored value of a CSR matrix by its row's (or column's) entry in `scale`."""
+    for i in numba.prange(indptr.shape[0] - 1):
+        for k in range(indptr[i], indptr[i + 1]):
+            s = scale[i] if by_row else scale[indices[k]]
+            out[k] = data[k] / s if divide else data[k] * s
+
+
 # numpy's pairwise summation, which `np.add.reduce` and `np.add.reduceat` (so scipy's sparse row
 # sums) use for float32 and float64: `@TYPE@_pairwise_sum` in numpy/_core/src/umath/loops_utils.h.src,
 # called by the float `add` loop when it reduces (`*io1 += pairwise_sum(rest)`). Up to 8 values

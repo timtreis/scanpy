@@ -358,6 +358,72 @@ def test_numba_thread_limit_none_is_noop() -> None:
         assert numba.get_num_threads() == outer
 
 
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("op", [mul, truediv])
+@pytest.mark.parametrize("writeable", [True, False], ids=["writeable", "readonly"])
+def test_axis_mul_or_truediv_out_in_place(
+    fmt: str, op, *, writeable: bool
+) -> None:
+    """With `out`, `x.data` is written in place (as `log1p` does), unless it is read-only."""
+    from scipy import sparse
+
+    x = sparse.random(50, 20, density=0.3, format=fmt, dtype=np.float64, rng=0)
+    x.data.flags.writeable = writeable
+    sibling = type(x)(
+        (x.data, x.indices, x.indptr), shape=x.shape
+    )  # shares x's buffers
+    before = sibling.toarray()
+    scale = np.linspace(1, 2, 20)
+    res = axis_mul_or_truediv(x, scale, op=op, axis=1, out=x)
+    assert np.shares_memory(res.data, sibling.data) is writeable
+    # the same elementwise arithmetic as numpy's
+    np.testing.assert_array_equal(res.toarray(), op(before, scale))
+    np.testing.assert_array_equal(
+        sibling.toarray(), res.toarray() if writeable else before
+    )
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("op", [mul, truediv])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_axis_mul_or_truediv_no_out_leaves_input(fmt: str, op, axis: int) -> None:
+    """Without `out`, the result is a new matrix and the input keeps its values."""
+    from scipy import sparse
+
+    x = sparse.random(50, 20, density=0.3, format=fmt, dtype=np.float64, rng=0)
+    before = x.toarray()
+    scale = np.linspace(1, 2, x.shape[axis])
+    res = axis_mul_or_truediv(x, scale, op=op, axis=axis)
+    assert not np.shares_memory(res.data, x.data)
+    np.testing.assert_array_equal(x.toarray(), before)
+    np.testing.assert_array_equal(
+        res.toarray(), op(before, scale[:, None] if axis == 0 else scale)
+    )
+
+
+@pytest.mark.filterwarnings("ignore:divide by zero encountered:RuntimeWarning")
+def test_divide_by_zero_off_main_thread() -> None:
+    """fast-array-utils runs kernels serially off the main thread; division by zero must still give inf."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from scipy import sparse
+
+    x = sparse.csr_matrix(np.array([[0, 1.0, 2.0], [3.0, 0, 4.0]]))  # noqa: TID251
+    divisor = np.array([0.1, 0.2, 0.0])
+    with ThreadPoolExecutor(1) as pool:
+        res = pool.submit(
+            axis_mul_or_truediv,
+            x,
+            divisor,
+            op=truediv,
+            axis=1,
+            allow_divide_by_zero=True,
+        ).result()
+    np.testing.assert_array_equal(
+        res.toarray(), np.array([[0, 5.0, np.inf], [30.0, 0, np.inf]])
+    )
+
+
 def test_has_canonical_format_matches_scipy() -> None:
     from scipy import sparse
 
