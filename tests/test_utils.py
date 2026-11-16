@@ -358,6 +358,23 @@ def test_numba_thread_limit_none_is_noop() -> None:
         assert numba.get_num_threads() == outer
 
 
+@needs.igraph
+def test_get_igraph_from_adjacency_matches_fancy_indexing() -> None:
+    from scipy import sparse
+
+    from scanpy._utils import get_igraph_from_adjacency
+
+    adj = sparse.random(300, 300, density=0.05, format="csr", random_state=0)
+    adj = adj + adj.T
+    adj.data[::7] = 0  # explicit zeros must not become edges
+    g = get_igraph_from_adjacency(
+        adj, directed=True
+    )  # undirected graphs reorder edge endpoints
+    src, dst = adj.nonzero()
+    assert g.get_edgelist() == list(zip(src.tolist(), dst.tolist(), strict=True))
+    np.testing.assert_array_equal(g.es["weight"], np.asarray(adj[src, dst]).ravel())
+
+
 def test_has_canonical_format_matches_scipy() -> None:
     from scipy import sparse
 

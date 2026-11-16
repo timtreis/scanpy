@@ -1,0 +1,1 @@
+Speed up building igraph graphs from a canonical CSR adjacency matrix, which {func}`~scanpy.tl.leiden`, {func}`~scanpy.tl.louvain`, {func}`~scanpy.tl.paga`, {func}`~scanpy.tl.draw_graph` and {func}`~scanpy.metrics.modularity` do. The graph is the same as before {smaller}`T Treis`

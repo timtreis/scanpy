@@ -36,8 +36,8 @@ from array_api_compat import array_namespace
 from fast_array_utils.types import HasArrayNamespace
 
 from .. import logging as logg
-from .._compat import CSBase, DaskArray, SpBase, warn
-from ._numba import _numba_thread_limit
+from .._compat import CSBase, CSRBase, DaskArray, SpBase, warn
+from ._numba import _numba_thread_limit, has_canonical_format
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, KeysView
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
     from pandas._typing import Dtype as PdDtype
 
-    from .._compat import CSRBase
     from ..neighbors import RPForestDict
     from ..neighbors._types import NeighborsParams
 
@@ -307,10 +306,14 @@ def get_igraph_from_adjacency(adjacency: CSBase, *, directed: bool) -> Graph:
         )
 
     sources, targets = adjacency.nonzero()
-    weights = dematrix(adjacency[sources, targets]).ravel() if len(sources) else []
+    if isinstance(adjacency, CSRBase) and has_canonical_format(adjacency):
+        # `nonzero` yields stored non-zeros in storage order, so this equals fancy indexing, without its cost
+        weights = adjacency.data[adjacency.data != 0]
+    else:
+        weights = dematrix(adjacency[sources, targets]).ravel() if len(sources) else []
     g = ig.Graph(directed=directed)
     g.add_vertices(adjacency.shape[0])  # this adds adjacency.shape[0] vertices
-    g.add_edges(list(zip(sources, targets, strict=True)))
+    g.add_edges(np.column_stack([sources, targets]))
     with suppress(KeyError):
         g.es["weight"] = weights
     if g.vcount() != adjacency.shape[0]:
