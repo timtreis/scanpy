@@ -37,7 +37,7 @@ from fast_array_utils.types import HasArrayNamespace
 
 from .. import logging as logg
 from .._compat import CSBase, DaskArray, SpBase, warn
-from ._numba import _numba_thread_limit
+from ._numba import FLOAT_DTYPES, _numba_thread_limit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, KeysView
@@ -864,6 +864,11 @@ def _check_nonnegative_integers_in_mem(x: _MemoryArray, /) -> bool:
     data = x if isinstance(x, np.ndarray) else x.data
     if np.issubdtype(data.dtype, np.unsignedinteger):
         return True
+    if data.dtype in FLOAT_DTYPES and data.flags.c_contiguous:
+        from ._numba import _all_nonnegative_integers, _scan_chunks
+
+        # one parallel pass without temporaries, stopping early on non-count data
+        return _all_nonnegative_integers(data.reshape(-1), _scan_chunks(data.size))
     # Check no negatives
     if np.signbit(data).any():
         return False
@@ -928,16 +933,19 @@ def select_groups(
     if f"{key}_masks" in adata.uns:
         groups_masks_obs = adata.uns[f"{key}_masks"]
     else:
-        groups_masks_obs = np.zeros(
-            (len(adata.obs[key].cat.categories), adata.obs[key].size), dtype=bool
-        )
-        for iname, name in enumerate(adata.obs[key].cat.categories):
-            # if the name is not found, fallback to index retrieval
-            if name in adata.obs[key].array:
-                mask_obs = name == adata.obs[key].to_numpy()
-            else:
-                mask_obs = str(iname) == adata.obs[key].to_numpy()
-            groups_masks_obs[iname] = mask_obs
+        # compare integer codes: converting the (possibly Arrow-backed) column per group is slow
+        codes = adata.obs[key].cat.codes.to_numpy()
+        n_cats = len(groups_order)
+        present = np.bincount(codes[codes >= 0], minlength=n_cats) > 0
+        groups_masks_obs = np.zeros((n_cats, codes.size), dtype=bool)
+        values = None
+        for iname in range(n_cats):
+            if present[iname]:
+                groups_masks_obs[iname] = codes == iname
+            else:  # if the name is not found, fallback to index retrieval
+                if values is None:
+                    values = adata.obs[key].to_numpy()
+                groups_masks_obs[iname] = str(iname) == values
     if groups_order_subset == "all":
         return groups_order.to_numpy(), groups_masks_obs
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numba
 import numpy as np
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
     from typing import TypeIs
 
     from numpy.typing import NDArray
+
+    from .._compat import CSCBase
 
 
 # Floating-point reductions whose partial sums are added in a fixed order split their input into
@@ -60,6 +63,27 @@ def _is_numba_csr(x: object) -> TypeIs[CSRBase]:
     return isinstance(x, CSRBase) and _is_numba_dtype(x.dtype)
 
 
+class CompressedArrays(NamedTuple):
+    """The arrays of a CSR/CSC matrix, for numba kernels.
+
+    numba can only disk-cache functions whose argument types it can pickle, which
+    scipy matrices aren't. Same attribute names, so kernel bodies needn't change.
+    """
+
+    indptr: NDArray[np.integer]
+    indices: NDArray[np.integer]
+    data: NDArray[np.number]
+    shape: NDArray[
+        np.int64
+    ]  # an array: numba's parallel lowering rejects nested tuples
+
+
+def arrays(x: CSRBase | CSCBase) -> CompressedArrays:
+    return CompressedArrays(
+        x.indptr, x.indices, x.data, np.array(x.shape, dtype=np.int64)
+    )
+
+
 def _resolve_n_threads(n_threads: int) -> int:
     n_max = numba.config.NUMBA_NUM_THREADS
     if n_threads < -1:
@@ -97,6 +121,20 @@ def _scan_chunks(n: int) -> int:
     its thread. Never use it for floating-point reductions (see `N_REDUCE_CHUNKS`).
     """
     return max(1, min(n // _MIN_SCAN_CHUNK, 64 * numba.get_num_threads()))
+
+
+@njit
+def _all_nonnegative_integers(data: NDArray[np.floating], n_chunks: int) -> bool:
+    """Whether all values are finite, non-negative (no ``-0.0``) and integral."""
+    n = data.shape[0]
+    bad = np.zeros(n_chunks, dtype=np.bool)
+    for c in numba.prange(n_chunks):
+        for i in range(c * n // n_chunks, (c + 1) * n // n_chunks):
+            v = data[i]
+            if not math.isfinite(v) or math.copysign(1.0, v) < 0 or v != math.floor(v):
+                bad[c] = True
+                break
+    return not bad.any()
 
 
 @njit

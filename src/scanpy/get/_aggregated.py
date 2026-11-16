@@ -18,11 +18,14 @@ from .._docs import doc_ref_compat
 from .._settings import Preset, settings
 from .._utils import _doc_params, _resolve_axis, get_literal_vals
 from .._utils._doctests import doctest_needs
+from .._utils._numba import arrays
 from ._kernels import (
+    _scale_dof,
+    _warn_nan_var,
     agg_sum_csc,
     agg_sum_csr,
+    grouped_mean_var,
     mean_var_csc,
-    mean_var_csr,
     mean_var_dense,
 )
 from ._use import _check_mask, _get_arr, _get_vec, _refs_dim, _resolve_ref
@@ -110,7 +113,7 @@ class Aggregate[ArrayT: np.ndarray | CSBase]:
         dtype = np.int64 if np.issubdtype(data.dtype, np.integer) else np.float64
         out = np.zeros((self.indicator_matrix.shape[0], data.shape[1]), dtype=dtype)
         (agg_sum_csr if isinstance(data, CSRBase) else agg_sum_csc)(
-            self.indicator_matrix, data, out
+            arrays(self.indicator_matrix), arrays(data), out
         )
         return out
 
@@ -155,18 +158,16 @@ class Aggregate[ArrayT: np.ndarray | CSBase]:
 
         group_counts = _group_counts(self.groupby, self.mask)
         if isinstance(self.data, np.ndarray):
-            mean_, var_ = mean_var_dense(self.indicator_matrix.tocsr(), self.data)
+            mean_, var_ = mean_var_dense(
+                arrays(self.indicator_matrix.tocsr()), self.data
+            )
+        elif isinstance(self.data, CSRBase):
+            ind = self.indicator_matrix
+            mean_, var_, _ = grouped_mean_var(self.data, ind.indices, ind.indptr)
         else:
-            mean_, var_ = (
-                mean_var_csr if isinstance(self.data, CSRBase) else mean_var_csc
-            )(self.indicator_matrix, self.data)
-        if dof != 0:
-            denom = np.where(group_counts > dof, group_counts - dof, np.nan)
-            which_nan = np.isnan(denom)
-            if which_nan.any():
-                msg = f"Group counts matches dof, resulting var for groups {self.groupby.categories[which_nan].to_list()} will be nan"
-                warn(msg, RuntimeWarning)
-            var_ *= (group_counts / denom)[:, np.newaxis]
+            mean_, var_ = mean_var_csc(arrays(self.indicator_matrix), arrays(self.data))
+        if dof != 0 and (which_nan := _scale_dof(var_, group_counts, dof)).any():
+            _warn_nan_var(self.groupby.categories[which_nan].to_list())
         return mean_, var_
 
     def median(self) -> Array:

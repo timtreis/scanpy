@@ -15,6 +15,7 @@ from .. import logging as logg
 from .._compat import CSBase, CSCBase, CSRBase, DaskArray, warn
 from .._docs import DEPR_KEY_ADDED, doc_out, doc_out_multi, doc_use
 from .._utils import _doc_params, axis_mul_or_truediv, dematrix, view_to_actual
+from .._utils._numba import arrays
 from ..get._out import (
     _dest_key,
     _legacy_out,
@@ -141,7 +142,7 @@ def _normalize_total_helper(
     if isinstance(x, CSRBase):
         n_threads = numba.get_num_threads()
         counts_per_cell, counts_per_cols = _normalize_csr(
-            x,
+            arrays(x),  # not `x`: a scipy matrix argument isn't disk-cached
             rows=x.shape[0],
             columns=x.shape[1],
             exclude_highly_expressed=exclude_highly_expressed,

@@ -1,0 +1,1 @@
+Speed up {func}`~scanpy.tl.rank_genes_groups` and the `"mean"` and `"var"` functions of {func}`~scanpy.get.aggregate` on CSR matrices: per-group statistics run in parallel over blocks of genes and groups, and the t-tests and multiple-testing corrections of the groups run in threads. Results are identical to before {smaller}`T Treis`

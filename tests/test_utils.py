@@ -170,6 +170,22 @@ def test_scale_rechunk(array_type, axis, op):
         pytest.param(
             lambda _: np.array([[0, 0, 0], [0, -1, 0], [0, 0, 0]]), False, id="middle"
         ),
+        pytest.param(
+            lambda rng: rng.poisson(size=(100, 100)).astype(np.float32),
+            True,
+            id="poisson-float32",
+        ),
+        pytest.param(lambda _: np.array([[1.0, np.nan], [2.0, 3.0]]), False, id="nan"),
+        pytest.param(lambda _: np.array([[1.0, np.inf], [2.0, 3.0]]), False, id="inf"),
+        pytest.param(
+            # only the very last value is fractional: must be found in the last chunk
+            lambda rng: np.concatenate([
+                rng.poisson(size=(999, 1000)).astype(np.float64),
+                np.r_[np.ones(999), 0.5][None],
+            ]),
+            False,
+            id="last-value",
+        ),
     ],
 )
 def test_check_nonnegative_integers(
@@ -356,6 +372,26 @@ def test_numba_thread_limit_none_is_noop() -> None:
     with _numba_thread_limit(None) as resolved:
         assert resolved is None
         assert numba.get_num_threads() == outer
+
+
+def test_select_groups_masks_match_value_comparison() -> None:
+    import pandas as pd
+    from anndata import AnnData
+
+    from scanpy._utils import select_groups
+
+    # "0" is an unused category name *and* matches the index-fallback of unused category 2
+    cats = ["a", "b", "unused", "0"]
+    values = pd.Categorical(["a", "b", "a", "0", "b"], categories=cats)
+    adata = AnnData(obs=pd.DataFrame({"g": values}, index=[f"c{i}" for i in range(5)]))
+    names, masks = select_groups(adata, key="g")
+    arr = np.asarray(values.astype(str))
+    expected = np.stack([
+        (name == arr) if name in values else (str(i) == arr)
+        for i, name in enumerate(cats)
+    ])
+    np.testing.assert_array_equal(masks, expected)
+    assert list(names) == cats
 
 
 def test_has_canonical_format_matches_scipy() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numba
@@ -33,8 +34,17 @@ from .._utils import (
     get_literal_vals,
     raise_not_implemented_error_if_backed_type,
 )
+from .._utils._numba import _is_numba_csr, eliminate_zeros, has_canonical_format
 from ..get import aggregate
 from ..get._aggregated import _chan_combine
+from ..get._kernels import (
+    _N_COL_BLOCKS,
+    _group_layout,
+    _scale_dof,
+    _warn_nan_var,
+    mean_var_csr_blocked,
+    sum_csr_blocked,
+)
 from ..get._out import _out_key, deprecated_copy
 from ..get._uns import _use_to_uns
 from ..get._use import (
@@ -46,11 +56,12 @@ from ..get._use import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
     from typing import Any, Literal
 
     from numpy.typing import NDArray
 
+    from .._compat import CSRBase
     from ..get._types import AdRef, LayerAcc, Mask
 
 
@@ -258,6 +269,38 @@ def _vars_rest(
     return vars_rest
 
 
+def _grouped_stats_csr(
+    x: CSRBase,
+    codes: NDArray[np.int64],
+    n_groups: int,
+    *,
+    need_var: bool,
+    n_blocks: int = _N_COL_BLOCKS,
+) -> tuple[NDArray[np.float64], NDArray[np.float64] | None, NDArray[np.int64]]:
+    """Per-group mean, variance (``dof=1``, if `need_var`) and non-zero count of each column of ``x``.
+
+    Bit-identical to what :func:`scanpy.get.aggregate` gives for ``func=["mean", "count_nonzero"]``,
+    plus ``"var"`` if `need_var`: like it, the mean is ``sum / count`` without the variance and
+    comes from Welford's algorithm with it. Groups without cells get zeros, groups with one cell a
+    variance of NaN (with `aggregate`'s warning). ``x`` needs sorted indices without duplicates.
+    """
+    rows, group_ptr, counts = _group_layout(codes, n_groups)
+    if not need_var:
+        sums, nnz = sum_csr_blocked(x, rows, group_ptr, n_blocks=n_blocks)
+        mean = np.zeros(sums.shape)
+        present = counts > 0  # `aggregate` drops empty groups
+        mean[present] = sums[present] / counts[present, None]
+        return mean, None, nnz
+    # with explicit zeros, `nnz` counts them too (`_RankGenes` eliminates them)
+    mean, var, nnz = mean_var_csr_blocked(x, rows, group_ptr, n_blocks=n_blocks)
+    # unbiased, as `aggregate(..., dof=1)`, which warns about the groups of one
+    if (single := _scale_dof(var, counts, 1) & (counts > 0)).any():
+        # `aggregate` gets the codes as its groups, and labels them as strings (`_combine_categories`)
+        _warn_nan_var([str(g) for g in np.flatnonzero(single)])
+    var[counts == 0] = 0.0
+    return mean, var, nnz
+
+
 class _RankGenes:
     def __init__(  # noqa: PLR0912
         self,
@@ -315,8 +358,7 @@ class _RankGenes:
             x = np.asarray(x)
 
         # for correct getnnz calculation
-        if isinstance(x, CSBase):
-            x.eliminate_zeros()
+        eliminate_zeros(x)
 
         if self.mask_var is not None:
             self.X = x[:, self.mask_var]
@@ -377,6 +419,12 @@ class _RankGenes:
         no cells. ``var`` is ``None`` unless ``need_var``; ``nnz`` is ``None``
         unless ``self.comp_pts``.
         """
+        if _is_numba_csr(x_used) and has_canonical_format(x_used):
+            # the same arithmetic as the `aggregate` call below, in parallel over gene blocks too
+            mean, var, nnz = _grouped_stats_csr(
+                x_used, codes, n_groups, need_var=need_var
+            )
+            return mean, var, nnz if self.comp_pts else None
         n_genes = x_used.shape[1]
         mean = np.zeros((n_groups, n_genes))
         var = np.zeros((n_groups, n_genes)) if need_var else None
@@ -483,53 +531,59 @@ class _RankGenes:
     def t_test(
         self, method: Literal["t-test", "t-test_overestim_var"]
     ) -> Generator[_TestResult]:
+        if method not in {"t-test", "t-test_overestim_var"}:
+            msg = "Method does not exist."
+            raise ValueError(msg)
+        groups = [
+            g
+            for g in range(len(self.groups_masks_obs))
+            if self.ireference is None or g != self.ireference
+        ]
+        # each group's test only reads shared arrays, and scipy's special functions release the GIL
+        yield from _thread_map(partial(self._t_test_group, method=method), groups)
+
+    def _t_test_group(
+        self, group_index: int, *, method: Literal["t-test", "t-test_overestim_var"]
+    ) -> _TestResult:
         from scipy import stats
 
-        for group_index, (mask_obs, mean_group, var_group) in enumerate(
-            zip(self.groups_masks_obs, self.means, self.vars, strict=True)
-        ):
-            if self.ireference is not None and group_index == self.ireference:
-                continue
+        mask_obs = self.groups_masks_obs[group_index]
+        mean_group, var_group = self.means[group_index], self.vars[group_index]
+        ns_group = np.count_nonzero(mask_obs)
 
-            ns_group = np.count_nonzero(mask_obs)
+        if self.ireference is not None:
+            mean_rest = self.means[self.ireference]
+            var_rest = self.vars[self.ireference]
+            ns_other = np.count_nonzero(self.groups_masks_obs[self.ireference])
+        else:
+            mean_rest = self.means_rest[group_index]
+            var_rest = self.vars_rest[group_index]
+            ns_other = self.X.shape[0] - ns_group
 
-            if self.ireference is not None:
-                mean_rest = self.means[self.ireference]
-                var_rest = self.vars[self.ireference]
-                ns_other = np.count_nonzero(self.groups_masks_obs[self.ireference])
-            else:
-                mean_rest = self.means_rest[group_index]
-                var_rest = self.vars_rest[group_index]
-                ns_other = self.X.shape[0] - ns_group
+        if method == "t-test":
+            ns_rest = ns_other
+        else:  # "t-test_overestim_var": hack for overestimating the variance for small groups
+            ns_rest = ns_group
 
-            if method == "t-test":
-                ns_rest = ns_other
-            elif method == "t-test_overestim_var":
-                # hack for overestimating the variance for small groups
-                ns_rest = ns_group
-            else:
-                msg = "Method does not exist."
-                raise ValueError(msg)
+        # TODO: Come up with better solution. Mask unexpressed genes?
+        # See https://github.com/scipy/scipy/issues/10269
+        with np.errstate(invalid="ignore"):
+            scores, pvals = stats.ttest_ind_from_stats(
+                mean1=mean_group,
+                std1=np.sqrt(var_group),
+                nobs1=ns_group,
+                mean2=mean_rest,
+                std2=np.sqrt(var_rest),
+                nobs2=ns_rest,
+                equal_var=False,  # Welch's
+            )
 
-            # TODO: Come up with better solution. Mask unexpressed genes?
-            # See https://github.com/scipy/scipy/issues/10269
-            with np.errstate(invalid="ignore"):
-                scores, pvals = stats.ttest_ind_from_stats(
-                    mean1=mean_group,
-                    std1=np.sqrt(var_group),
-                    nobs1=ns_group,
-                    mean2=mean_rest,
-                    std2=np.sqrt(var_rest),
-                    nobs2=ns_rest,
-                    equal_var=False,  # Welch's
-                )
+        # I think it's only nan when means are the same and vars are 0
+        scores[np.isnan(scores)] = 0
+        # This also has to happen for Benjamini Hochberg
+        pvals[np.isnan(pvals)] = 1
 
-            # I think it's only nan when means are the same and vars are 0
-            scores[np.isnan(scores)] = 0
-            # This also has to happen for Benjamini Hochberg
-            pvals[np.isnan(pvals)] = 1
-
-            yield group_index, scores, pvals
+        return group_index, scores, pvals
 
     def wilcoxon(self, *, tie_correct: bool) -> Generator[_TestResult]:
         from scipy import stats
@@ -708,6 +762,28 @@ class _RankGenes:
         )
 
 
+def _thread_map[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
+    """``list(map(fn, items))``, on as many threads as numba uses, results in order.
+
+    For per-group work that only reads shared arrays and spends its time in numpy or scipy
+    functions that release the GIL: each item gets exactly the result it would get serially.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    items = list(items)
+    n_threads = min(len(items), numba.get_num_threads())
+    if n_threads <= 1:
+        return [fn(item) for item in items]
+    err = np.geterr()  # `np.errstate` is per thread
+
+    def work(item: T) -> R:
+        with np.errstate(**err):
+            return fn(item)
+
+    with ThreadPoolExecutor(n_threads) as pool:
+        return list(pool.map(work, items))
+
+
 def _build_stats_dataframe(
     rg: _RankGenes,
     results: Iterable[_TestResult],
@@ -723,46 +799,27 @@ def _build_stats_dataframe(
     multiple-testing correction, and (when ``rg.means`` is set) log2
     fold-change. Read-only on ``rg``.
     """
-    from statsmodels.stats.multitest import multipletests
-
-    n_genes_total = rg.X.shape[1]
+    group_columns = partial(
+        _group_columns,
+        rg,
+        corr_method=corr_method,
+        n_genes_user=n_genes_user,
+        rankby_abs=rankby_abs,
+        mean_in_log_space=mean_in_log_space,
+    )
+    # A list holds independent arrays (the t-test's), so its groups can be processed in threads.
+    # Other iterables are drained one group at a time: `wilcoxon` reuses its arrays between groups.
+    per_group = (
+        _thread_map(group_columns, results)
+        if isinstance(results, list)
+        else map(group_columns, results)
+    )
     cols: dict[tuple[str, str], NDArray] = {}
-
-    for group_index, scores, pvals in results:
-        group_name = str(rg.groups_order[group_index])
-
+    for group_name, global_indices, group_cols in per_group:
         if n_genes_user is not None:
-            scores_sort = np.abs(scores) if rankby_abs else scores
-            global_indices = _select_top_n(scores_sort, n_genes_user)
             cols[group_name, "names"] = rg.var_names[global_indices]
-        else:
-            global_indices = slice(None)
-        cols[group_name, "scores"] = scores[global_indices]
-
-        if pvals is not None:
-            cols[group_name, "pvals"] = pvals[global_indices]
-            if corr_method == "benjamini-hochberg":
-                pvals_no_nan = np.where(np.isnan(pvals), 1.0, pvals)
-                _, pvals_adj, _, _ = multipletests(
-                    pvals_no_nan, alpha=0.05, method="fdr_bh"
-                )
-            elif corr_method == "bonferroni":
-                pvals_adj = np.minimum(pvals * n_genes_total, 1.0)
-            cols[group_name, "pvals_adj"] = pvals_adj[global_indices]
-
-        if rg.means is not None:
-            mean_group = rg.means[group_index]
-            mean_rest = (
-                rg.means_rest[group_index]
-                if rg.ireference is None
-                else rg.means[rg.ireference]
-            )
-            foldchanges = (
-                (rg.expm1_func(mean_group) + 1e-9) / (rg.expm1_func(mean_rest) + 1e-9)
-                if mean_in_log_space
-                else (mean_group + 1e-9) / (mean_rest + 1e-9)
-            )  # add small value to avoid zeros
-            cols[group_name, "logfoldchanges"] = np.log2(foldchanges[global_indices])
+        for stat, col in group_cols.items():
+            cols[group_name, stat] = col
 
     if not cols:
         return None
@@ -771,6 +828,58 @@ def _build_stats_dataframe(
     if n_genes_user is None:
         df.index = rg.var_names
     return df
+
+
+def _group_columns(
+    rg: _RankGenes,
+    result: _TestResult,
+    *,
+    corr_method: _CorrMethod,
+    n_genes_user: int | None,
+    rankby_abs: bool,
+    mean_in_log_space: bool,
+) -> tuple[str, NDArray[np.intp] | slice, dict[str, NDArray]]:
+    """One group's name, selected genes and statistics columns (all but "names"), in column order."""
+    from statsmodels.stats.multitest import multipletests
+
+    group_index, scores, pvals = result
+    n_genes_total = rg.X.shape[1]
+    group_name = str(rg.groups_order[group_index])
+    cols: dict[str, NDArray] = {}
+
+    if n_genes_user is not None:
+        scores_sort = np.abs(scores) if rankby_abs else scores
+        global_indices = _select_top_n(scores_sort, n_genes_user)
+    else:
+        global_indices = slice(None)
+    cols["scores"] = scores[global_indices]
+
+    if pvals is not None:
+        cols["pvals"] = pvals[global_indices]
+        if corr_method == "benjamini-hochberg":
+            pvals_no_nan = np.where(np.isnan(pvals), 1.0, pvals)
+            _, pvals_adj, _, _ = multipletests(
+                pvals_no_nan, alpha=0.05, method="fdr_bh"
+            )
+        elif corr_method == "bonferroni":
+            pvals_adj = np.minimum(pvals * n_genes_total, 1.0)
+        cols["pvals_adj"] = pvals_adj[global_indices]
+
+    if rg.means is not None:
+        mean_group = rg.means[group_index]
+        mean_rest = (
+            rg.means_rest[group_index]
+            if rg.ireference is None
+            else rg.means[rg.ireference]
+        )
+        foldchanges = (
+            (rg.expm1_func(mean_group) + 1e-9) / (rg.expm1_func(mean_rest) + 1e-9)
+            if mean_in_log_space
+            else (mean_group + 1e-9) / (mean_rest + 1e-9)
+        )  # add small value to avoid zeros
+        cols["logfoldchanges"] = np.log2(foldchanges[global_indices])
+
+    return group_name, global_indices, cols
 
 
 @_doc_params(
