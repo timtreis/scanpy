@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from anndata.typing import ArrayDataStructureType
+    from sklearn.decomposition import PCA
 
     ArrayType = Callable[[np.ndarray], ArrayDataStructureType]
 
@@ -657,3 +658,281 @@ def test_cov_sparse_dask(dtype, dtype_arg, rtol):
     np.testing.assert_allclose(gram, (x_arr.T @ x_arr) / x.shape[0])
     tol_args = dict(rtol=rtol) if rtol is not None else {}
     np.testing.assert_allclose(cov, np.cov(x_arr, rowvar=False, bias=True), **tol_args)
+
+
+@pytest.fixture
+def fast_mode() -> Generator[None]:
+    """Run with `settings.reference_numerics` off, where CSR `covariance_eigh` takes `PCAEighSparse`."""
+    with sc.settings.override(reference_numerics=False):
+        yield
+
+
+def _blas_is_openblas() -> bool:
+    from threadpoolctl import threadpool_info
+
+    return all(
+        info["internal_api"] == "openblas"
+        for info in threadpool_info()
+        if info["user_api"] == "blas"
+    )
+
+
+def _skip_unless_replay(dtype: np.dtype) -> None:
+    from scanpy.preprocessing._pca import _kernels
+
+    if not _kernels._replays_sklearn(np.dtype(dtype)):
+        pytest.skip("this scipy build fuses multiply-adds; the default runs sklearn")
+
+
+def _csr_for_replay(dtype: type, sparse_cls: type[CSBase]) -> CSBase:
+    """Mixed signs, empty columns and stored zeros."""
+    rng = np.random.default_rng(0)
+    dense = rng.standard_normal((1500, 40)).astype(dtype)
+    dense[rng.random(dense.shape) < 0.8] = 0
+    dense[:, [0, 5, 6, 39]] = 0
+    x = sparse_cls(dense)
+    x.data[::11] = 0
+    return x
+
+
+def _assert_same_pca(got: tuple, ref: PCA, ref_pca: np.ndarray) -> None:
+    x_pca, pcs, var_ratio, var = got
+    for a, b in [
+        (x_pca, ref_pca),
+        (pcs, ref.components_),
+        (var, ref.explained_variance_),
+        (var_ratio, ref.explained_variance_ratio_),
+    ]:
+        assert a.dtype == b.dtype
+        np.testing.assert_array_equal(a, b)
+
+
+# every other column: includes the empty columns 0 and 6, excludes 5 and 39
+REPLAY_MASK = np.arange(40) % 2 == 0
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("sparse_cls", [sparse.csr_matrix, sparse.csr_array])
+@pytest.mark.parametrize("mask", [None, REPLAY_MASK], ids=["all", "mask"])
+def test_covariance_eigh_sparse_reference_is_sklearn(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: type,
+    sparse_cls: type[CSBase],
+    mask: np.ndarray | None,
+) -> None:
+    """By default, CSR `covariance_eigh` replays sklearn's arithmetic in parallel, bit for bit."""
+    from sklearn.decomposition import PCA
+
+    from scanpy.preprocessing._pca import _kernels
+
+    _skip_unless_replay(dtype)
+    replay, ran = _kernels._covariance_eigh_replay, []
+
+    def spy(*args):
+        ran.append((res := replay(*args)) is not None)
+        return res
+
+    monkeypatch.setattr(_kernels, "_covariance_eigh_replay", spy)
+    monkeypatch.setattr(_kernels, "_REF_BLOCK_ENTRIES", 500)  # many row blocks
+    x = _csr_for_replay(dtype, sparse_cls)
+    got = sc.pp.pca(
+        x, n_comps=12, svd_solver="covariance_eigh", mask=mask, return_info=True
+    )
+    ref = PCA(12, svd_solver="covariance_eigh")
+    ref_pca = ref.fit_transform(x if mask is None else x[:, mask])
+    assert ran == [True]
+    _assert_same_pca(got, ref, ref_pca)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("mask", [None, REPLAY_MASK], ids=["all", "mask"])
+def test_gram_mean_replay_is_scipy(
+    monkeypatch: pytest.MonkeyPatch, dtype: type, mask: np.ndarray | None
+) -> None:
+    """The gram matrix and mean are scipy's bits, for any number of threads."""
+    import numba
+
+    from scanpy.preprocessing._pca import _kernels
+
+    _skip_unless_replay(dtype)
+    monkeypatch.setattr(_kernels, "_REF_BLOCK_ENTRIES", 500)
+    x = _csr_for_replay(dtype, sparse.csr_matrix)
+    cols = None if mask is None else np.flatnonzero(mask)
+    x_sel = x if cols is None else x[:, cols]
+    slot = _kernels._slot_map(x.shape[1], cols)
+    n_threads = numba.get_num_threads()
+    results = []
+    for n in {1, 3, n_threads}:
+        numba.set_num_threads(min(n, n_threads))
+        try:
+            results.append(_kernels._gram_mean_replay(x, slot, x_sel.shape[1]))
+        finally:
+            numba.set_num_threads(n_threads)
+    for gram, mean in results:
+        np.testing.assert_array_equal(gram, (x_sel.T @ x_sel).toarray())
+        np.testing.assert_array_equal(mean, np.asarray(x_sel.mean(axis=0)).ravel())
+        assert gram.dtype == mean.dtype == dtype
+
+
+@pytest.mark.parametrize("mask", [False, True], ids=["all", "mask"])
+def test_covariance_eigh_sparse_reference_pbmc(*, mask: bool) -> None:
+    """On real data, with and without a mask, as upstream (which subsets with anndata first)."""
+    from sklearn.decomposition import PCA
+
+    adata = pbmc3k_normalized()[:, :300].copy()
+    m = (np.arange(adata.n_vars) % 3 == 0) if mask else None
+    got = sc.pp.pca(
+        adata.X, n_comps=20, svd_solver="covariance_eigh", mask=m, return_info=True
+    )
+    ref = PCA(20, svd_solver="covariance_eigh")
+    ref_pca = ref.fit_transform(adata.X if m is None else adata[:, m].X)
+    _assert_same_pca(got, ref, ref_pca)
+
+
+@pytest.mark.parametrize("kind", ["duplicates", "unsorted"])
+def test_covariance_eigh_sparse_reference_noncanonical(kind: str) -> None:
+    """Rows the replay can't take (unsorted or duplicate columns) go to sklearn itself."""
+    from sklearn.decomposition import PCA
+
+    x = _csr_for_replay(np.float32, sparse.csr_matrix)
+    if kind == "duplicates":
+        x = _helpers.with_duplicates(x)
+    else:
+        indices, data = x.indices.copy(), x.data.copy()
+        for lo, hi in zip(x.indptr[:-1], x.indptr[1:], strict=True):
+            indices[lo:hi], data[lo:hi] = indices[lo:hi][::-1], data[lo:hi][::-1]
+        x = sparse.csr_matrix((data, indices, x.indptr.copy()), shape=x.shape)
+        assert not x.has_sorted_indices
+    got = sc.pp.pca(x, n_comps=8, svd_solver="covariance_eigh", return_info=True)
+    ref = PCA(8, svd_solver="covariance_eigh")
+    _assert_same_pca(got, ref, ref.fit_transform(x))
+
+
+def test_covariance_eigh_sparse_reference_nan() -> None:
+    x = _csr_for_replay(np.float32, sparse.csr_matrix)
+    x.data[3] = np.nan
+    with pytest.raises(ValueError, match=r"contains NaN"):
+        sc.pp.pca(x, n_comps=5, svd_solver="covariance_eigh")
+
+
+@pytest.mark.usefixtures("fast_mode")
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_covariance_eigh_sparse_dtypes(dtype: type) -> None:
+    """`PCAEighSparse` returns sklearn's dtypes, though it computes in float64."""
+    from sklearn.decomposition import PCA
+
+    x = sparse.random(300, 40, density=0.2, format="csr", dtype=dtype, rng=0)
+    _, pcs, var_ratio, var = sc.pp.pca(
+        x, n_comps=5, svd_solver="covariance_eigh", return_info=True
+    )
+    ref = PCA(5, svd_solver="covariance_eigh").fit(x)
+    assert pcs.dtype == ref.components_.dtype
+    assert var.dtype == ref.explained_variance_.dtype
+    assert var_ratio.dtype == ref.explained_variance_ratio_.dtype
+    np.testing.assert_allclose(pcs, ref.components_, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.usefixtures("fast_mode")
+def test_covariance_eigh_sparse_matches_sklearn() -> None:
+    """The parallel in-memory CSR path matches sklearn's dense `covariance_eigh`, including signs."""
+    from sklearn.decomposition import PCA
+
+    adata = pbmc3k_normalized()[:, :300].copy()
+    x_pca, pcs, var_ratio, var = sc.pp.pca(
+        adata.X, n_comps=20, svd_solver="covariance_eigh", return_info=True
+    )
+    ref = PCA(20, svd_solver="covariance_eigh").fit(
+        adata.X.toarray().astype(np.float64)
+    )
+    np.testing.assert_allclose(var, ref.explained_variance_, rtol=1e-5)
+    np.testing.assert_allclose(var_ratio, ref.explained_variance_ratio_, rtol=1e-5)
+    np.testing.assert_allclose(pcs, ref.components_, atol=1e-5)
+    np.testing.assert_allclose(
+        x_pca, ref.transform(adata.X.toarray().astype(np.float64)), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_blocked_gram_matches_dense_and_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The blocked gram equals the dense one on the selected columns, independent of the BLAS thread count.
+
+    Bit for bit with OpenBLAS, which splits dsyrk's output between threads; MKL may split the sums.
+    """
+    from threadpoolctl import threadpool_limits
+
+    from scanpy.preprocessing._pca import _kernels
+
+    x = sparse.random(5000, 60, density=0.1, format="csr", dtype=np.float32, rng=0)
+    cols = np.array([3, 7, 8, 20, 41, 59])
+    dense = x[:, cols].toarray().astype(np.float64)
+    # several blocks of 700 rows, the last one partial
+    monkeypatch.setattr(_kernels, "_BLOCK_BYTES", 8 * len(cols) * 700)
+    slot = _kernels._slot_map(x.shape[1], cols)
+    gn, sn = _kernels.blocked_gram(x, slot, len(cols))
+    with threadpool_limits(1):
+        g1, s1 = _kernels.blocked_gram(x, slot, len(cols))
+    np.testing.assert_allclose(gn, dense.T @ dense, rtol=1e-12)
+    # column sums add rows in numpy's order: bit-identical to summing each block with numpy
+    expected = np.zeros(len(cols))
+    for lo in range(0, x.shape[0], 700):
+        expected += dense[lo : lo + 700].sum(axis=0)
+    np.testing.assert_array_equal(sn, expected)
+    np.testing.assert_array_equal(s1, sn)
+    if _blas_is_openblas():
+        np.testing.assert_array_equal(g1, gn)
+    else:
+        np.testing.assert_allclose(g1, gn, rtol=1e-12)
+
+
+@pytest.mark.usefixtures("fast_mode")
+def test_covariance_eigh_sparse_mask_matches_subset() -> None:
+    """Reading HVG columns through the column map gives the same PCA as an explicit subset."""
+    adata = pbmc3k_normalized()[:, :300].copy()
+    mask = np.zeros(adata.n_vars, dtype=bool)
+    mask[::3] = True
+    x_map = sc.pp.pca(adata.X, n_comps=10, svd_solver="covariance_eigh", mask=mask)
+    x_sub = sc.pp.pca(adata.X[:, mask], n_comps=10, svd_solver="covariance_eigh")
+    np.testing.assert_allclose(x_map, x_sub, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.usefixtures("fast_mode")
+def test_covariance_eigh_sparse_blas_thread_count_independent() -> None:
+    """Fast mode doesn't depend on the BLAS thread count: bit for bit with OpenBLAS (see above)."""
+    from threadpoolctl import threadpool_limits
+
+    x = sparse.random(2000, 400, density=0.1, format="csr", dtype=np.float32, rng=0)
+    adata = AnnData(x)
+    out = {}
+    for n_threads in (1, 4):
+        with threadpool_limits(n_threads, user_api="blas"):
+            a = adata.copy()
+            sc.pp.pca(a, n_comps=30, svd_solver="covariance_eigh")
+            out[n_threads] = a.obsm["X_pca"]
+    if _blas_is_openblas():
+        np.testing.assert_array_equal(out[1], out[4])
+    else:
+        np.testing.assert_allclose(out[1], out[4], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.usefixtures("fast_mode")
+def test_covariance_eigh_sparse_duplicate_entries() -> None:
+    x = sparse.random(500, 60, density=0.2, format="csr", dtype=np.float64, rng=0)
+    dup = _helpers.with_duplicates(x)
+    assert not dup.has_canonical_format
+    a, b = AnnData(x), AnnData(dup)
+    for adata in (a, b):
+        sc.pp.pca(adata, n_comps=10, svd_solver="covariance_eigh")
+    np.testing.assert_allclose(a.obsm["X_pca"], b.obsm["X_pca"], rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("reference", [True, False], ids=["reference", "fast"])
+def test_covariance_eigh_sparse_too_many_comps(*, reference: bool) -> None:
+    adata = AnnData(
+        sparse.random(100, 30, density=0.3, format="csr", dtype=np.float64, rng=0)
+    )
+    with (
+        sc.settings.override(reference_numerics=reference),
+        pytest.raises(ValueError, match=r"n_components=50 must be between 0 and"),
+    ):
+        sc.pp.pca(adata, n_comps=50, svd_solver="covariance_eigh")
