@@ -7,6 +7,7 @@ from scverse_misc import deprecated_arg
 from sklearn.utils import check_array
 
 from .. import logging as logg
+from .._compat import warn
 from .._docs import DEPR_KEY_ADDED, DEPR_NEIGHBORS_KEY, doc_out_key, doc_rng
 from .._keys import _embedding_keys
 from .._settings import Default, Preset, settings
@@ -79,7 +80,7 @@ def umap(  # noqa: PLR0913
     rng: SeedLike | RNGLike | None = None,
     a: float | None = None,
     b: float | None = None,
-    method: Literal["umap"] = "umap",
+    method: Literal["umap", "numba"] = "umap",
     compatibility_layout: bool | Default = Default(
         preset=("umap", "compatibility_layout")
     ),
@@ -166,10 +167,24 @@ def umap(  # noqa: PLR0913
 
         ``'umap'``
             Umap’s simplical set embedding.
+        ``'numba'``
+            Scanpy’s parallel layout optimiser, same objective as umap-learn’s
+            legacy optimiser. With a seed (the default), edges are processed in an
+            order that makes the result identical for any number of threads.
+            With `rng=None`, which also selects umap-learn’s non-reproducible parallel
+            optimiser for `method='umap'`, it uses lock-free (Hogwild) updates, which
+            is faster but not reproducible. Supports `n_components=2` and the `init_pos`
+            values `'spectral'` (also used for `'auto'`), `'random'`, `'paga'` and
+            coordinates. `'spectral'` is umap-learn’s spectral initialisation
+            (as with `compatibility_layout=False`), computed with parallel sparse products.
+            Embeddings differ from `method='umap'`.
+            :func:`~scanpy.tl.ingest` maps new data with umap-learn’s optimiser
+            whatever `method` computed the reference embedding.
     compatibility_layout
         Use the layout pipeline of umap-learn 0.5 (`True`)
         or the faster one introduced in umap-learn 0.6 (`False`).
         Stored in `.uns['umap']['params']`, so :func:`~scanpy.tl.ingest` can match it.
+        Ignored, with a warning, by `method='numba'`.
     {use}
     rep
         The data to lay out more than `2 * n_components` connected components with,
@@ -197,6 +212,14 @@ def umap(  # noqa: PLR0913
     non_deterministic = rng is None
     rng = np.random.default_rng(rng)
     key = _out_key(out, key_added, kind="obsm", default=Default())
+    if method == "numba":
+        # before any (possibly expensive) initialisation is computed
+        if n_components != 2:
+            msg = f"method='numba' supports n_components=2 only, got {n_components}."
+            raise ValueError(msg)
+        if not isinstance(compatibility_layout, Default):
+            msg = "`compatibility_layout` has no effect with method='numba'."
+            warn(msg, UserWarning)
 
     neighbors = _neighbors_view(adata, use, neighbors_key)
     if neighbors is None or "connectivities" not in neighbors:
@@ -214,6 +237,8 @@ def umap(  # noqa: PLR0913
 
     from umap.umap_ import find_ab_params, simplicial_set_embedding
 
+    from ._umap_layout import default_epochs
+
     compatibility_layout = _resolve_compatibility_layout(compatibility_layout)
     if a is None or b is None:
         a, b = find_ab_params(spread, min_dist)
@@ -223,11 +248,12 @@ def umap(  # noqa: PLR0913
     params = dict(
         a=a, b=b, compatibility_layout=compatibility_layout, **meta_random_state
     )
+    if method != "umap":
+        params["method"] = method
     init_coords = _init_coords(adata, init_pos, rng=rng, conns=conns)
     x = _umap_data(adata, conns, rep, neigh_params, n_components=n_components)
+    n_epochs = default_epochs(conns.shape[0]) if maxiter is None else maxiter
     if method == "umap":
-        default_epochs = 500 if conns.shape[0] <= 10000 else 200
-        n_epochs = default_epochs if maxiter is None else maxiter
         x_umap, _ = simplicial_set_embedding(
             data=x,
             # umap-learn’s layout functions are compiled for float32 only
@@ -249,6 +275,24 @@ def umap(  # noqa: PLR0913
             output_dens=False,
             verbose=settings.verbosity > 3,
             compatibility_layout=compatibility_layout,
+        )
+    elif method == "numba":
+        from ._umap_layout import optimize_layout
+
+        x_umap = optimize_layout(
+            _numba_init(
+                init_coords, conns, x, neigh_params, n_components=n_components, rng=rng
+            ),
+            conns,
+            n_epochs=n_epochs,
+            a=a,
+            b=b,
+            gamma=gamma,
+            alpha=alpha,
+            negative_sample_rate=negative_sample_rate,
+            seed=int(rng.integers(2**63)),
+            # `rng=None` asks for a non-reproducible run, like `parallel=True` above
+            deterministic=not non_deterministic,
         )
     else:
         msg = f"Unknown method {method}"
@@ -298,6 +342,47 @@ def _init_coords(
         case _:
             coords = init_pos
     return check_array(coords, dtype=np.float32, accept_sparse=False)
+
+
+def _numba_init(
+    init: np.ndarray | str | None,
+    conns: CSBase,
+    x: Any,
+    neigh_params: Mapping[str, Any],
+    *,
+    n_components: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Get initial coordinates for `method='numba'`, scaled as umap-learn’s legacy pipeline does."""
+    match init:
+        case np.ndarray():  # first: comparing an array to the string patterns below is element-wise
+            if init.shape[1] != n_components:
+                msg = f"`init_pos` has {init.shape[1]} columns, expected n_components={n_components}."
+                raise ValueError(msg)
+            emb = init
+        case "spectral" | "auto":
+            from ._spectral import spectral_layout
+
+            emb = spectral_layout(
+                x,
+                conns,
+                n_components,
+                _legacy_random_state(rng, always_state=True),
+                metric=neigh_params.get("metric", "euclidean"),
+                metric_kwds=neigh_params.get("metric_kwds", {}),
+            )
+            emb = emb * (10.0 / np.abs(emb).max()) + rng.normal(
+                scale=1e-4, size=emb.shape
+            )
+        case "random":
+            emb = rng.uniform(-10.0, 10.0, size=(conns.shape[0], n_components))
+        case _:
+            msg = f"method='numba' does not support init_pos={init!r}; use 'spectral', 'random', 'paga' or coordinates."
+            raise ValueError(msg)
+    lo, hi = emb.min(axis=0), emb.max(axis=0)
+    # umap-learn divides by zero here (NaN); map a constant column to 0 instead, as sklearn’s MinMaxScaler does
+    span = np.where(hi > lo, hi - lo, 1.0)
+    return (10.0 * (emb - lo) / span).astype(np.float32)
 
 
 def _umap_data(

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import numba
+import numpy as np
 
 from .._compat import warn
 
@@ -39,3 +40,11 @@ def _numba_thread_limit(n_threads: int | None) -> Generator[int | None]:
         yield resolved
     finally:
         numba.set_num_threads(previous)
+
+
+@numba.njit(cache=True, inline="always")  # noqa: TID251 (inlined into callers' kernels)
+def _mix(z: np.uint64) -> np.uint64:
+    """Splitmix64 finaliser, for counter-based random streams."""
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
