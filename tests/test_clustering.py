@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING
@@ -389,11 +390,38 @@ def test_leiden_key_added_deprecated(
     assert adata_neighbors.uns.keys() == expected.uns.keys()
 
 
+def test_leiden_numba_multi_resolution(adata_neighbors: AnnData) -> None:
+    resolutions = [0.5, 1, 2.0]
+    keys = ["leiden_res0_5", "leiden_res1", "leiden_res2"]
+    sc.tl.leiden(adata_neighbors, resolution=resolutions, flavor="numba", rng=0)
+    for res, key in zip(resolutions, keys, strict=True):
+        assert adata_neighbors.uns[key]["params"]["resolution"] == res
+        # a resolution computed alone gives the same clusters as within a sequence
+        alone = sc.tl.leiden(
+            adata_neighbors, resolution=res, flavor="numba", rng=0, out=True
+        )
+        pd.testing.assert_series_equal(
+            adata_neighbors.obs[key].astype(str),
+            pd.Series(alone.astype(str), index=adata_neighbors.obs_names, name=key),
+        )
+    assert (
+        adata_neighbors.obs["leiden_res0_5"].nunique()
+        < adata_neighbors.obs["leiden_res2"].nunique()
+    )
+    serial = sc.tl.leiden(
+        adata_neighbors, resolution=resolutions, flavor="numba", rng=0, out=True, n_jobs=1
+    )
+    assert list(serial) == [0.5, 1.0, 2.0]
+    for res, key in zip(resolutions, keys, strict=True):
+        assert list(serial[res]) == list(adata_neighbors.obs[key])
+
+
 @pytest.mark.parametrize(
     "flavor",
     [
         pytest.param("igraph", marks=needs.igraph),
         pytest.param("networkit", marks=needs.networkit),
+        "numba",
     ],
 )
 @pytest.mark.parametrize("restrict", [False, True], ids=["plain", "restrict"])
@@ -413,15 +441,15 @@ def test_leiden_multi_resolution_keys(
     assert base not in adata_neighbors.obs
 
 
-@pytest.fixture(params=[pytest.param("igraph", marks=needs.igraph)])
-def multi_flavor(request: pytest.FixtureRequest) -> Literal["igraph"]:
-    """The default flavor, for the multi-resolution API."""
+@pytest.fixture(params=[pytest.param("igraph", marks=needs.igraph), "numba"])
+def multi_flavor(request: pytest.FixtureRequest) -> Literal["igraph", "numba"]:
+    """The default flavor and Scanpy’s own, for the multi-resolution API."""
     return request.param
 
 
 @needs.anndata_acc
 def test_leiden_multi_resolution_out_mapping(
-    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph", "numba"]
 ) -> None:
     from anndata.acc import A
 
@@ -442,7 +470,7 @@ def test_leiden_multi_resolution_out_mapping(
 
 
 def test_leiden_multi_resolution_out_true(
-    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph", "numba"]
 ) -> None:
     """Returns a dict, and a resolution within a sequence gives what it gives alone."""
     from typing import assert_type
@@ -464,7 +492,6 @@ def test_leiden_multi_resolution_out_true(
     assert set(adata_neighbors.uns) == uns_before
 
 
-@needs.igraph
 @pytest.mark.parametrize(
     ("resolution", "keys"),
     [
@@ -486,31 +513,30 @@ def test_leiden_multi_resolution_key_names(
     adata_neighbors: AnnData, resolution: list[float] | np.ndarray, keys: list[str]
 ) -> None:
     """Keys are rounded, positional and have no `-`; `uns` keeps the value as given."""
-    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="igraph", rng=0)
+    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="numba", rng=0)
     for key, res in zip(keys, np.asarray(resolution).tolist(), strict=True):
         assert key in adata_neighbors.obs
         assert adata_neighbors.uns[key]["params"]["resolution"] == pytest.approx(res)
 
 
 @needs.anndata_acc
-@needs.igraph
 def test_leiden_multi_resolution_float32(adata_neighbors: AnnData) -> None:
     """float32 resolutions are taken as written, so `out` and the result use those values."""
     from anndata.acc import A
 
     res = np.array([0.1, 0.5], np.float32)
     multi = sc.tl.leiden(
-        adata_neighbors, resolution=res, flavor="igraph", rng=0, out=True
+        adata_neighbors, resolution=res, flavor="numba", rng=0, out=True
     )
     assert list(multi) == [0.1, 0.5]
     alone = sc.tl.leiden(
-        adata_neighbors, resolution=0.1, flavor="igraph", rng=0, out=True
+        adata_neighbors, resolution=0.1, flavor="numba", rng=0, out=True
     )
     assert list(multi[0.1]) == list(alone)
     sc.tl.leiden(
         adata_neighbors,
         resolution=res,
-        flavor="igraph",
+        flavor="numba",
         rng=0,
         out={0.1: A.obs["a"], 0.5: A.obs["b"]},
     )
@@ -519,7 +545,7 @@ def test_leiden_multi_resolution_float32(adata_neighbors: AnnData) -> None:
 
 @needs.anndata_acc
 def test_leiden_multi_resolution_restrict_reads_input(
-    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph", "numba"]
 ) -> None:
     """With `restrict_to`, every resolution relabels the column as it was before the call."""
     from anndata.acc import A
@@ -544,6 +570,10 @@ def test_leiden_multi_resolution_restrict_reads_input(
         pytest.param(
             dict(resolution=[0.3, 0.1 + 0.2]), ValueError, r"same key", id="key-clash"
         ),
+        pytest.param(dict(beta=0), ValueError, r"`beta`", id="beta-zero"),
+        pytest.param(dict(beta=-0.5), ValueError, r"`beta`", id="beta-negative"),
+        pytest.param(dict(beta=np.nan), ValueError, r"`beta`", id="beta-nan"),
+        pytest.param(dict(beta=np.inf), ValueError, r"`beta`", id="beta-inf"),
         pytest.param(dict(resolution=[]), ValueError, r"empty", id="empty"),
         pytest.param(dict(resolution=[1, 1.0]), ValueError, r"distinct", id="dupe"),
         pytest.param(
@@ -592,7 +622,7 @@ def test_leiden_multi_resolution_restrict_reads_input(
 )
 def test_leiden_resolution_errors(
     adata_neighbors: AnnData,
-    multi_flavor: Literal["igraph"],
+    multi_flavor: Literal["igraph", "numba"],
     kwargs: dict,
     exc: type[Exception],
     match: str,
@@ -603,7 +633,103 @@ def test_leiden_resolution_errors(
     assert set(adata_neighbors.obs) == obs_before
 
 
+def test_leiden_numba_negative_resolution(adata_neighbors: AnnData) -> None:
+    with pytest.raises(ValueError, match=r"must not be negative"):
+        sc.tl.leiden(adata_neighbors, flavor="numba", resolution=-1)
+
+
+def test_leiden_numba_kernel_beta() -> None:
+    """The kernel checks `beta` too, so every schedule rejects it alike."""
+    from scipy import sparse
+
+    from scanpy.tools._leiden_numba import leiden
+
+    adj = sparse.csr_array(np.ones((3, 3), np.float32))
+    with pytest.raises(ValueError, match=r"`beta`"):
+        leiden(adj, [1.0], beta=0.0)
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        pytest.param([1.0, -0.5], r"Negative weight", id="negative"),
+        # opposite signs would cancel when symmetrising, so they are checked before
+        pytest.param([1.0, -1.0], r"Negative weight", id="cancelling"),
+        pytest.param([1.0, np.inf], r"finite", id="inf"),
+    ],
+)
+def test_leiden_numba_bad_weights(data: list[float], match: str) -> None:
+    from scipy import sparse
+
+    from scanpy.tools._leiden_numba import leiden
+
+    # entries (0, 1) and (1, 0)
+    adj = sparse.csr_array((data, [1, 0], [0, 1, 2, 2]), shape=(3, 3))
+    with pytest.raises(ValueError, match=match):
+        leiden(adj, [1.0])
+
+
+def test_leiden_numba_no_resolutions(adata_neighbors: AnnData) -> None:
+    from scanpy.tools._leiden_numba import leiden
+
+    memb, q = leiden(adata_neighbors.obsp["connectivities"], [])
+    assert memb.shape == (0, adata_neighbors.n_obs)
+    assert q.shape == (0,)
+
+
+def test_leiden_numba_n_jobs(
+    mocker: MockerFixture, adata_neighbors: AnnData
+) -> None:
+    """`n_jobs` (default: `settings.n_jobs`, also when seeded) limits numba’s threads."""
+    import numba
+
+    sc.settings.n_jobs = 1
+    spy = mocker.spy(numba, "set_num_threads")
+    sc.tl.leiden(adata_neighbors, flavor="numba", rng=0)
+    assert spy.call_args_list[0].args == (1,)
+    spy.reset_mock()
+    sc.tl.leiden(adata_neighbors, flavor="numba", rng=0, n_jobs=2)
+    assert spy.call_args_list[0].args == (min(2, numba.config.NUMBA_NUM_THREADS),)
+
+
+def test_leiden_numba_iteration_cap_warns(
+    adata_neighbors: AnnData, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scanpy.tools import _leiden_numba as ln
+
+    monkeypatch.setattr(ln, "_MAX_ITERATIONS", 1)
+    with pytest.warns(UserWarning, match=r"didn’t converge within 1 iterations"):
+        sc.tl.leiden(adata_neighbors, flavor="numba", n_iterations=-1)
+    monkeypatch.undo()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", r".*converge", UserWarning)
+        sc.tl.leiden(adata_neighbors, flavor="numba", n_iterations=-1)
+
+
 @needs.igraph
+def test_leiden_numba_quality_like_igraph(adata_neighbors: AnnData) -> None:
+    conns = adata_neighbors.obsp["connectivities"]
+    ours = sc.tl.leiden(
+        adata_neighbors, flavor="numba", n_iterations=2, rng=0, out=True
+    )
+    ref = sc.tl.leiden(
+        adata_neighbors, flavor="igraph", n_iterations=2, rng=0, out=True
+    )
+    q_ours = sc.metrics.modularity(conns, ours, is_directed=False)
+    q_ref = sc.metrics.modularity(conns, ref, is_directed=False)
+    assert q_ours > q_ref - 0.01
+    assert normalized_mutual_info_score(ours, ref) > 0.8
+
+
+@needs.igraph
+def test_leiden_numba_modularity_like_metrics(adata_neighbors: AnnData) -> None:
+    """The stored modularity (resolution 1) is what `sc.metrics.modularity` computes."""
+    sc.tl.leiden(adata_neighbors, flavor="numba", rng=0)
+    assert adata_neighbors.uns["leiden"]["modularity"] == pytest.approx(
+        sc.metrics.modularity(adata_neighbors, "leiden"), rel=1e-5
+    )
+
+
 @pytest.mark.parametrize(
     "resolution", [1, np.array(1.0)], ids=["int", "0d-array"]
 )
@@ -611,6 +737,120 @@ def test_leiden_scalar_resolution_unchanged(
     adata_neighbors: AnnData, resolution: float | np.ndarray
 ) -> None:
     obs_before = set(adata_neighbors.obs)
-    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="igraph", rng=0)
+    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="numba", rng=0)
     assert set(adata_neighbors.obs) - obs_before == {"leiden"}
     assert adata_neighbors.uns["leiden"]["params"]["resolution"] is resolution
+
+
+def test_leiden_numba_apply_alone_is_noop() -> None:
+    """Two vertices of a 2-member community both propose a new singleton (path A-D-B, {A,B},{D}).
+
+    A kernel test: `leiden()` reaches this state only from initial memberships it builds itself.
+    """
+    from scanpy.tools._leiden_numba import _apply
+
+    ptr = np.array([0, 1, 3, 4])  # A=0 - D=1 - B=2
+    idx = np.array([1, 0, 2, 1])
+    g = (ptr, idx, np.ones(4, np.float32), np.ones(3))  # (indptr, indices, weights, node weights)
+    memb = np.array([0, 1, 0])
+    cw, nbn = np.array([2.0, 1.0, 0.0]), np.array([2, 1, 0])
+    empty = np.array([2, -1, -1])  # one free community
+    alist, prop = np.array([0, 2]), np.array([-1, 0, -1])
+    ne = _apply(g, memb, cw, nbn, empty, 1, alist, 2, np.ones(3, bool), prop)
+    assert ne == 0
+    assert set(memb.tolist()) == {0, 1, 2}  # A moved out, B stayed alone in 0
+    assert nbn.tolist() == [1, 1, 1]
+
+
+@needs.igraph
+def test_leiden_numba_asymmetric_graph_like_igraph() -> None:
+    """Asymmetric input and self-loops are read as igraph's undirected graph is."""
+    import igraph as ig
+    from scipy import sparse
+
+    from scanpy.tools._leiden_numba import leiden
+
+    adj = sparse.random(
+        300, 300, density=0.03, format="csr", random_state=0, dtype=np.float32
+    )
+    adj.setdiag(0.5)
+    (memb,), (q,) = leiden(adj, [1.0])
+    # one undirected edge per stored entry, as `flavor='igraph'` builds it
+    g = ig.Graph(n=300, edges=np.column_stack(adj.nonzero()).tolist(), directed=False)
+    assert q == pytest.approx(
+        g.modularity(memb.tolist(), weights=adj.data.tolist()), rel=1e-5
+    )
+
+
+def test_leiden_numba_edgeless() -> None:
+    from scipy import sparse
+
+    adata = AnnData(np.zeros((5, 2)))
+    adata.obsp["connectivities"] = sparse.csr_matrix((5, 5), dtype=np.float32)  # noqa: TID251
+    adata.uns["neighbors"] = dict(
+        connectivities_key="connectivities", params=dict(method="umap")
+    )
+    labels = sc.tl.leiden(adata, flavor="numba", out=True)
+    assert labels.categories.size == 5
+
+
+def _planted_graph(n: int = 20_000, *, hub: bool = False):
+    """20 planted communities: 8 edges into a vertex’s own, 2 anywhere; `hub`: vertex 0 joins all.
+
+    Large enough that colour classes take the parallel path (`_SMALL`).
+    """
+    from scipy import sparse
+
+    rng = np.random.default_rng(0)
+    k, d_in, d_out = 20, 8, 2
+    v = np.arange(n)
+    same = k * rng.integers(n // k, size=(n, d_in)) + (v % k)[:, None]
+    other = rng.integers(n, size=(n, d_out))
+    rows = np.repeat(v, d_in + d_out)
+    cols = np.hstack([same, other]).ravel()
+    if hub:
+        rows, cols = np.r_[rows, np.zeros(n, rows.dtype)], np.r_[cols, v]
+    w = rng.uniform(0.1, 1, rows.size).astype(np.float32)
+    return sparse.csr_array((w, (rows, cols)), shape=(n, n))
+
+
+@pytest.mark.parametrize("hub", [False, True], ids=["planted", "hub"])
+def test_leiden_numba_schedules_identical(
+    monkeypatch: pytest.MonkeyPatch, *, hub: bool
+) -> None:
+    """Memberships don’t depend on the thread or chunk count or the table size.
+
+    "hashed" tables are smaller than the graph, so vertices, clusters and rows above their key
+    limit (the hub, aggregated levels) take the dense table; "tiny" sends nearly everything there.
+    """
+    import numba
+
+    from scanpy._utils import _numba_thread_limit
+    from scanpy.tools import _leiden_numba as ln
+
+    graph, res = _planted_graph(hub=hub), [0.5, 1.0, 2.0]
+    ref = ln.leiden(graph, res)[0]
+    assert all(len(np.unique(m)) > 1 for m in ref)
+    threads = sorted({1, min(3, numba.config.NUMBA_NUM_THREADS)})
+    tables = dict(
+        dense=(ln._TABLE_MIN, ln._TABLE_MAX), hashed=(1 << 10, 1 << 10), tiny=(4, 4)
+    )
+    results = {}
+    for name, (lo, hi) in tables.items():
+        monkeypatch.setattr(ln, "_TABLE_MIN", lo)
+        monkeypatch.setattr(ln, "_TABLE_MAX", hi)
+        for n_threads in threads:
+            with _numba_thread_limit(n_threads):
+                results[name, n_threads] = ln.leiden(graph, res)[0]
+    monkeypatch.setattr(ln, "_TABLE_MIN", 1 << 10)
+    monkeypatch.setattr(ln, "_TABLE_MAX", 1 << 10)
+    with monkeypatch.context() as m:
+        m.setattr(ln, "_serial_only", lambda: True)  # the serial chain
+        results["serial"] = ln.leiden(graph, res)[0]
+    for name, memb in results.items():
+        np.testing.assert_array_equal(memb, ref, err_msg=str(name))
+
+
+def test_leiden_numba_unknown_argument(adata_neighbors: AnnData) -> None:
+    with pytest.raises(TypeError, match=r"objective_function"):
+        sc.tl.leiden(adata_neighbors, flavor="numba", objective_function="CPM")

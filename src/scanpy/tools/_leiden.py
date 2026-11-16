@@ -26,7 +26,7 @@ from .._docs import (
     doc_rng,
 )
 from .._settings import Default, settings
-from .._utils import _doc_params
+from .._utils import _doc_params, _numba_thread_limit
 from .._utils.random import _accepts_legacy_random_state, _LegacyRng, _set_igraph_rng
 from ..get._out import _check_legacy, _out_key, deprecated_copy
 from ..neighbors._common import _use_graph
@@ -263,11 +263,17 @@ def leiden(  # noqa: PLR0913
     flavor
         Which package's implementation to use.
         `'networkit'` runs in parallel (see `n_jobs`).
+        `'numba'` is Scanpy’s parallel implementation of igraph’s algorithm:
+        results are identical for any number of threads and for a resolution
+        computed alone or within a sequence, but differ from `'igraph'`’s.
+        It needs non-negative edge weights and non-negative resolutions.
     n_jobs
-        Number of threads for `flavor='networkit'` (`-1` means all cores).
-        With multiple threads, results for the same `rng` are similar but not identical,
+        Number of threads for `flavor='networkit'` and `flavor='numba'` (`-1` means all cores).
+        With `'networkit'` and multiple threads, results for the same `rng` are similar but not identical,
         so `None` means :attr:`scanpy.settings.n_jobs` if `rng=None` is passed
         and `1` otherwise, for exact reproducibility.
+        `'numba'`’s results don’t depend on the number of threads,
+        so `None` always means :attr:`scanpy.settings.n_jobs`.
     {use}
     {out}
     {adjacency}
@@ -278,6 +284,8 @@ def leiden(  # noqa: PLR0913
     **clustering_args
         Any further arguments to pass to :func:`~leidenalg.find_partition` (which in turn passes arguments to the `partition_type`)
         or :meth:`igraph.Graph.community_leiden` from `igraph`.
+        `flavor='numba'` only accepts `beta` (refinement randomness, default `0.01`).
+        `beta`, where passed, must be finite and positive.
 
     Returns
     -------
@@ -304,8 +312,13 @@ def leiden(  # noqa: PLR0913
     flavor, directed = _validate_flavor(
         flavor, partition_type=partition_type, directed=directed
     )
-    _utils.ensure_igraph()
+    if flavor != "numba":
+        _utils.ensure_igraph()
     clustering_args = dict(clustering_args)
+    if "beta" in clustering_args:
+        _check_beta(clustering_args["beta"])
+    # numba’s results don’t depend on the thread count, so seeded runs can be parallel too
+    numba_threads = settings.n_jobs if n_jobs is None else n_jobs
     if n_jobs is None:
         # unseeded runs needn’t be reproducible, so they can be parallel
         n_jobs = settings.n_jobs if rng is None else 1
@@ -353,26 +366,36 @@ def leiden(  # noqa: PLR0913
     # as this allows for the accounting of a None resolution
     # (in the case of a partition variant that doesn't take it on input)
     clustering_args["n_iterations"] = n_iterations
-    # each resolution starts from the generator's state, as a single call would
-    rewind = _rewinder(rng)
-    parts = []
-    for res in resolutions:
-        rewind()
-        parts.append(
-            _leiden_single(
+    if flavor == "numba":
+        with _numba_thread_limit(numba_threads):
+            parts = _leiden_numba(
                 adjacency,
-                res,
-                flavor=flavor,
+                resolutions,
                 rng=rng,
-                seeded=seeded,
-                directed=directed,
                 use_weights=use_weights,
-                n_iterations=n_iterations,
-                n_jobs=n_jobs,
-                partition_type=partition_type,
-                clustering_args=dict(clustering_args),
+                **clustering_args,
             )
-        )
+    else:
+        # each resolution starts from the generator's state, as a single call would
+        rewind = _rewinder(rng)
+        parts = []
+        for res in resolutions:
+            rewind()
+            parts.append(
+                _leiden_single(
+                    adjacency,
+                    res,
+                    flavor=flavor,
+                    rng=rng,
+                    seeded=seeded,
+                    directed=directed,
+                    use_weights=use_weights,
+                    n_iterations=n_iterations,
+                    n_jobs=n_jobs,
+                    partition_type=partition_type,
+                    clustering_args=dict(clustering_args),
+                )
+            )
     # all labels first: with `restrict_to`, a result may be written to the restricted column
     results: list[pd.Categorical] = []
     for part in parts:
@@ -445,6 +468,16 @@ def _as_float(r: object) -> float:
     if isinstance(r, np.floating) and r.dtype.itemsize < 8:
         return float(np.format_float_positional(r, unique=True))
     return float(cast("float", r))
+
+
+def _check_beta(beta: object) -> None:
+    if (
+        isinstance(beta, bool)
+        or not isinstance(beta, Real)
+        or not (math.isfinite(beta) and beta > 0)
+    ):
+        msg = f"`beta` must be finite and positive, got {beta!r}."
+        raise ValueError(msg)
 
 
 def _rewinder(rng: np.random.Generator) -> Callable[[], None]:
@@ -585,6 +618,31 @@ def _leiden_single(  # noqa: PLR0913
     )
 
 
+def _leiden_numba(
+    adjacency: CSBase,
+    resolutions: Sequence[float | None],
+    *,
+    rng: np.random.Generator,
+    use_weights: bool,
+    **kwargs: Any,
+) -> list[SimpleNamespace]:
+    """Cluster at all resolutions in one call of Scanpy’s numba Leiden (`kwargs` go to the kernel)."""
+    from ._leiden_numba import leiden as leiden_numba
+
+    graph = adjacency if use_weights else adjacency.astype(bool).astype(np.float32)
+    res = [1.0 if r is None else float(r) for r in resolutions]
+    seed = (
+        int(rng.arg)
+        if isinstance(rng, _LegacyRng) and isinstance(rng.arg, int | np.integer)
+        else int(rng.integers(np.iinfo(np.int64).max))
+    )
+    membership, modularity = leiden_numba(graph, res, seed=seed, **kwargs)
+    return [
+        SimpleNamespace(membership=m, modularity=float(q))
+        for m, q in zip(membership, modularity, strict=True)
+    ]
+
+
 def _leiden_networkit(
     adjacency: CSBase,
     *,
@@ -670,7 +728,7 @@ def _directed_node_weights(
     )
 
 
-def _validate_flavor(
+def _validate_flavor(  # noqa: PLR0912
     flavor: str | None,
     *,
     partition_type: object | None,
@@ -685,6 +743,13 @@ def _validate_flavor(
         case "igraph":
             if partition_type is not None:
                 msg = "Do not pass in partition_type argument when using igraph."
+                raise ValueError(msg)
+        case "numba":
+            if is_directed:
+                msg = "flavor='numba' only supports undirected graphs."
+                raise ValueError(msg)
+            if partition_type is not None:
+                msg = "Do not pass in partition_type argument when using numba."
                 raise ValueError(msg)
         case "networkit":
             if is_directed:
@@ -712,7 +777,7 @@ def _validate_flavor(
                 )
                 raise
         case _:
-            msg = f"flavor must be either 'igraph', 'leidenalg', or 'networkit', but {flavor!r} was passed."
+            msg = f"flavor must be either 'igraph', 'leidenalg', 'networkit', or 'numba', but {flavor!r} was passed."
             raise ValueError(msg)
     return flavor, is_directed
 
