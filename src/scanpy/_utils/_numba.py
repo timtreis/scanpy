@@ -213,6 +213,14 @@ def _scale_csr(  # noqa: PLR0917
             out[k] = data[k] / s if divide else data[k] * s
 
 
+@numba.njit(cache=True, inline="always")  # noqa: TID251 (inlined into callers' kernels)
+def _mix(z: np.uint64) -> np.uint64:
+    """Splitmix64 finaliser, for counter-based random streams."""
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
+
+
 # numpy's pairwise summation, which `np.add.reduce` and `np.add.reduceat` (so scipy's sparse row
 # sums) use for float32 and float64: `@TYPE@_pairwise_sum` in numpy/_core/src/umath/loops_utils.h.src,
 # called by the float `add` loop when it reduces (`*io1 += pairwise_sum(rest)`). Up to 8 values
