@@ -74,6 +74,7 @@ def filter_cells(
     min_genes: int | None = None,
     max_counts: int | None = None,
     max_genes: int | None = None,
+    mask: Mask | None = None,
     out: VecRef | bool = False,
     copy: bool = False,
     # deprecated
@@ -86,7 +87,7 @@ def filter_cells(
     i.e. “unreliable” observations.
 
     Only provide one of the optional parameters `min_counts`, `min_genes`,
-    `max_counts`, `max_genes` per call.
+    `max_counts`, `max_genes`, `mask` per call.
 
     Parameters
     ----------
@@ -101,6 +102,14 @@ def filter_cells(
         Maximum number of counts required for a cell to pass filtering.
     max_genes
         Maximum number of genes expressed required for a cell to pass filtering.
+    mask
+        Boolean mask of the cells to keep, or a reference to one,
+        e.g. the name of a boolean `.obs` column or `A.obs['keep']`
+        (a :class:`~pandas.Series` is taken by position, not aligned to `.obs`).
+        Only for :class:`~anndata.AnnData`, which is subset in place unless `copy=True`.
+        With an anndata version that supports it, a CSR `X` is compacted in place
+        instead of copied: `X` stays the same object,
+        and anything else that refers to the old `X` or its buffers sees the compacted data.
     out
         Where to write the counts per cell (see below), e.g. `A.obs['n_genes']`.
         If :data:`True`, return the mask and counts instead of subsetting `data` and writing them.
@@ -161,14 +170,33 @@ def filter_cells(
     """
     out = _legacy_out(out, "inplace", None if inplace else True)
     n_given_options = sum(
-        option is not None for option in [min_genes, min_counts, max_genes, max_counts]
+        option is not None
+        for option in [min_genes, min_counts, max_genes, max_counts, mask]
     )
     if n_given_options != 1:
         msg = (
             "Provide exactly one of the optional parameters `min_counts`, "
-            "`min_genes`, `max_counts`, `max_genes` per call."
+            "`min_genes`, `max_counts`, `max_genes`, `mask` per call."
         )
         raise ValueError(msg)
+    if mask is not None:
+        if not isinstance(data, AnnData):
+            msg = "`mask` is only supported for AnnData."
+            raise TypeError(msg)
+        if out is not False:  # `out=True` (or `inplace=False`) asks for the counts instead
+            msg = "`mask` subsets `data`; it can't be combined with `out` or `inplace=False`."
+            raise TypeError(msg)
+        raise_not_implemented_error_if_backed_type(data.X, "filter_cells")
+        keep = np.asarray(_check_mask(data, mask, "obs"))
+        if copy:
+            return data[keep].copy()
+        from inspect import signature
+
+        if "compact" in signature(AnnData._inplace_subset_obs).parameters:
+            data._inplace_subset_obs(keep, compact=True)
+        else:  # anndata without in-place compaction
+            data._inplace_subset_obs(keep)
+        return None
     if isinstance(data, AnnData):
         raise_not_implemented_error_if_backed_type(data.X, "filter_cells")
         adata = data.copy() if copy else data

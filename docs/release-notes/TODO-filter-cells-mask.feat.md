@@ -1,0 +1,1 @@
+Add `mask` to {func}`~scanpy.pp.filter_cells` to keep the cells in a boolean mask or a boolean `.obs` column, subsetting the {class}`~anndata.AnnData` in place. With an anndata version that supports it, a CSR `X` is compacted in place instead of copied, so the subset doesn't need a second copy of `X` {smaller}`T Treis`
