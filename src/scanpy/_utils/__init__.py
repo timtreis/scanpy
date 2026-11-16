@@ -36,8 +36,8 @@ from array_api_compat import array_namespace
 from fast_array_utils.types import HasArrayNamespace
 
 from .. import logging as logg
-from .._compat import CSBase, DaskArray, SpBase, warn
-from ._numba import FLOAT_DTYPES, _numba_thread_limit
+from .._compat import CSBase, CSRBase, DaskArray, SpBase, warn
+from ._numba import FLOAT_DTYPES, _numba_thread_limit, has_canonical_format
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, KeysView
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike, NDArray
     from pandas._typing import Dtype as PdDtype
 
-    from .._compat import CSRBase
     from ..neighbors import RPForestDict
     from ..neighbors._types import NeighborsParams
 
@@ -307,10 +306,14 @@ def get_igraph_from_adjacency(adjacency: CSBase, *, directed: bool) -> Graph:
         )
 
     sources, targets = adjacency.nonzero()
-    weights = dematrix(adjacency[sources, targets]).ravel() if len(sources) else []
+    if isinstance(adjacency, CSRBase) and has_canonical_format(adjacency):
+        # `nonzero` yields stored non-zeros in storage order, so this equals fancy indexing, without its cost
+        weights = adjacency.data[adjacency.data != 0]
+    else:
+        weights = dematrix(adjacency[sources, targets]).ravel() if len(sources) else []
     g = ig.Graph(directed=directed)
     g.add_vertices(adjacency.shape[0])  # this adds adjacency.shape[0] vertices
-    g.add_edges(list(zip(sources, targets, strict=True)))
+    g.add_edges(np.column_stack([sources, targets]))
     with suppress(KeyError):
         g.es["weight"] = weights
     if g.vcount() != adjacency.shape[0]:
@@ -697,17 +700,49 @@ def _(
     if x.format == "csr":
         indices = x.indices
         indptr = x.indptr
+        scale = np.asarray(scaling_array).ravel()
+        # numba's serial fallback raises on division by zero where numpy gives inf;
+        # numba doesn't bounds-check, where numpy raises on a scale of the wrong length
+        if (
+            x.data.dtype in FLOAT_DTYPES
+            and np.result_type(x.data, scale) == x.data.dtype
+            and scale.shape[0] == x.shape[0 if row_scale else 1]
+            and not (op is truediv and (scale == 0).any())
+        ):
+            from ._numba import _scale_csr
+
+            # in parallel and without the `np.repeat` temporary. With `out` (i.e. `x`), into `x.data`
+            # itself, as `log1p` does: other matrices sharing that buffer see the new values too
+            data = (
+                x.data
+                if out is not None and x.data.flags.writeable
+                else np.empty_like(x.data)
+            )
+            _scale_csr(
+                x.data,
+                indptr,
+                indices,
+                scale.astype(data.dtype),
+                row_scale,
+                op is truediv,
+                data,
+            )
+            if out is not None:
+                x.data = data
+                return x
+            return type(x)((data, indices.copy(), indptr.copy()), shape=x.shape)
         if out is not None:
             x.data = new_data_op(x)
             return x
         return type(x)((new_data_op(x), indices.copy(), indptr.copy()), shape=x.shape)
+    # the CSR transpose shares `x`'s buffers: write into them only if asked to (`out`)
     transposed = x.T
     return axis_mul_or_truediv(
         transposed,
         scaling_array,
         op=op,
         axis=1 - axis,
-        out=transposed,
+        out=None if out is None else transposed,
         allow_divide_by_zero=allow_divide_by_zero,
     ).T
 
