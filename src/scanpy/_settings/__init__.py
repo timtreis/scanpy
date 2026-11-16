@@ -140,6 +140,17 @@ class Settings(scverse_misc.Settings):
         The default changed from `1` to `4`.
     """
 
+    reference_numerics: bool = True
+    """Whether results match Scanpy's reference arithmetic bit for bit (default `True`).
+
+    With `True`, functions give exactly the results they gave before their parallel
+    kernels were added.
+    With `False`, some functions take faster paths that sum in a different order or
+    precision, so results can differ in the last bits. They are still reproducible,
+    and don't depend on the number of threads.
+    Affected: :func:`~scanpy.pp.calculate_qc_metrics` (float data).
+    """
+
     categories_to_ignore: Container[str] = frozenset({
         "N/A",
         "dontknow",

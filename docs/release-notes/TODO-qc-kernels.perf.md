@@ -1,0 +1,1 @@
+Speed up {func}`~scanpy.pp.calculate_qc_metrics` on CSR matrices with parallel numba kernels, with results identical to before. The new setting {attr}`scanpy.settings.reference_numerics` can be set to `False` to let float data take faster kernels, whose sums can differ in the last bits {smaller}`T Treis`

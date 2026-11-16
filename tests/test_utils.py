@@ -29,6 +29,7 @@ from scanpy._utils.random import (
     random_k_tuples,
     random_str,
 )
+from testing.scanpy._helpers import with_duplicates
 from testing.scanpy._pytest.marks import needs
 from testing.scanpy._pytest.params import (
     ARRAY_TYPES,
@@ -355,3 +356,56 @@ def test_numba_thread_limit_none_is_noop() -> None:
     with _numba_thread_limit(None) as resolved:
         assert resolved is None
         assert numba.get_num_threads() == outer
+
+
+def test_has_canonical_format_matches_scipy() -> None:
+    from scipy import sparse
+
+    from scanpy._utils._numba import has_canonical_format
+
+    x = sparse.random(300, 50, density=0.2, format="csr", rng=0)
+    unsorted = x.copy()
+    row = np.flatnonzero(np.diff(x.indptr) >= 2)[0]
+    lo, hi = x.indptr[row], x.indptr[row + 1]
+    unsorted.indices[lo:hi] = unsorted.indices[lo:hi][::-1]
+    dup = with_duplicates(x, split=False)
+    for m in (x, unsorted, dup, x.tocsc()):
+        expected = type(m)(
+            (m.data, m.indices, m.indptr), shape=m.shape
+        ).has_canonical_format
+        m2 = type(m)((m.data, m.indices, m.indptr), shape=m.shape)
+        assert has_canonical_format(m2) is expected
+        assert m2.has_canonical_format is expected  # cached for scipy
+
+
+def test_has_canonical_format_respects_unsorted_flag() -> None:
+    """A cached ``has_sorted_indices = False`` means not canonical, as in scipy."""
+    from scipy import sparse
+
+    from scanpy._utils._numba import has_canonical_format
+
+    x = sparse.random(30, 20, density=0.2, format="csr", rng=0)
+    x.has_canonical_format = True  # cached as canonical (and sorted)
+    x.has_sorted_indices = False
+    assert x.has_canonical_format is False  # scipy's semantics
+    x.has_canonical_format = True
+    x.has_sorted_indices = False
+    assert has_canonical_format(x) is False
+    assert x.has_canonical_format is False
+
+
+@pytest.mark.parametrize("dtype", [np.longdouble, np.complex64, np.float32, np.int64])
+def test_eliminate_zeros_dtypes(dtype: type) -> None:
+    """Dtypes without numba kernels (long double, complex) fall back to scipy."""
+    from scipy import sparse
+
+    from scanpy._utils._numba import eliminate_zeros
+
+    x = sparse.csr_matrix(np.array([[0, 1, 2], [3, 0, 4]], dtype=dtype))  # noqa: TID251
+    x.data[1] = 0
+    expected = x.copy()
+    expected.eliminate_zeros()
+    eliminate_zeros(x)
+    np.testing.assert_array_equal(x.data, expected.data)
+    np.testing.assert_array_equal(x.indices, expected.indices)
+    np.testing.assert_array_equal(x.indptr, expected.indptr)

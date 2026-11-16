@@ -18,7 +18,11 @@ from scanpy.preprocessing._qc import (
     top_proportions,
     top_segment_proportions,
 )
-from testing.scanpy._helpers import as_sparse_dask_matrix, maybe_dask_process_context
+from testing.scanpy._helpers import (
+    as_sparse_dask_matrix,
+    maybe_dask_process_context,
+    with_duplicates,
+)
 from testing.scanpy._pytest.marks import needs
 from testing.scanpy._pytest.params import ARRAY_TYPES, ARRAY_TYPES_MEM
 
@@ -367,3 +371,212 @@ def test_qc_metrics_out_mapping(adata: AnnData) -> None:
     assert "only_obs" not in adata.varm
     with pytest.raises(TypeError, match=r"must be written to one of \['obsm'\]"):
         sc.pp.calculate_qc_metrics(adata, out={"obs": A.obs["x"]})
+
+
+def test_qc_metrics_fast_thread_count_independent() -> None:
+    """Without reference numerics, float QC sums use fixed chunks: the bits don't depend on the thread count."""
+    import numba
+
+    from scanpy._utils._numba import _numba_thread_limit
+
+    n_threads = min(4, numba.config.NUMBA_NUM_THREADS)
+    if n_threads == 1:
+        pytest.skip("needs several threads")
+    x = sparse.random(5000, 60, density=0.1, format="csr", dtype=np.float32, rng=0)
+    var = pd.DataFrame({"mt": np.arange(60) < 5}, index=[f"g{i}" for i in range(60)])
+    results = []
+    for n in (1, n_threads):
+        with sc.settings.override(reference_numerics=False), _numba_thread_limit(n):
+            results.append(
+                sc.pp.calculate_qc_metrics(
+                    AnnData(x.copy(), var=var), qc_vars=["mt"], percent_top=None
+                )
+            )
+    for one, many in zip(*results, strict=True):
+        pd.testing.assert_frame_equal(one, many, check_exact=True)
+
+
+@pytest.mark.parametrize("deterministic", [True, False], ids=["det", "fast"])
+def test_qc_metrics_sum_duplicate_entries(*, deterministic: bool) -> None:
+    x = sparse.random(300, 40, density=0.2, format="csr", dtype=np.float64, rng=0)
+    x.data = np.ceil(x.data * 10)
+    dup = with_duplicates(x)
+    assert not dup.has_canonical_format
+    var = pd.DataFrame({"mt": np.arange(40) < 5}, index=[f"g{i}" for i in range(40)])
+    with sc.settings.override(reference_numerics=deterministic):
+        expected, got = (
+            sc.pp.calculate_qc_metrics(
+                AnnData(m, var=var), qc_vars=["mt"], percent_top=[5]
+            )
+            for m in (x, dup)
+        )
+    for e, g in zip(expected, got, strict=True):
+        pd.testing.assert_frame_equal(e, g)
+
+
+def _qc_reference(
+    x: sparse.csr_matrix, mask: np.ndarray
+) -> tuple[dict[str, np.ndarray], sparse.csr_matrix]:
+    """The metrics as `calculate_qc_metrics` computed them before its kernels, in the same order."""
+    from scanpy._utils import axis_nnz
+
+    x = x.copy()
+    x.eliminate_zeros()
+    ref = dict(
+        n_genes_by_counts=axis_nnz(x, axis=1),  # scipy sums duplicates in place here
+        total_counts=stats.sum(x, axis=1),
+        total_counts_mt=stats.sum(x[:, mask], axis=1),
+        n_cells_by_counts=axis_nnz(x, axis=0),
+        mean_counts=stats.mean(x, axis=0),
+        total_counts_var=stats.sum(x, axis=0),
+    )
+    return ref, x
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32, np.uint16])
+@pytest.mark.parametrize("duplicates", [False, True], ids=["canonical", "dups"])
+def test_qc_metrics_deterministic_matches_scipy(
+    dtype: type, *, duplicates: bool
+) -> None:
+    """With `settings.reference_numerics`, metrics are bit-identical to the scipy sums, in their dtypes.
+
+    Integer sums are exact in any order; float sums repeat scipy's operations in its order.
+    Fast mode agrees to rounding.
+    """
+    rng = np.random.default_rng(0)
+    x = sparse.random(400, 60, density=0.2, format="csr", dtype=np.float64, rng=rng)
+    x.data = np.ceil(x.data * 30)
+    if dtype not in {np.int32, np.uint16}:  # values that aren't exact sums of counts
+        x.data *= rng.random(x.data.shape) + 0.5
+    x = x.astype(dtype)
+    x.data[::11] = 0  # explicit zeros
+    if duplicates:
+        x = with_duplicates(x, split=False)
+    mask = np.arange(60) < 7
+    var = pd.DataFrame({"mt": mask}, index=[f"g{i}" for i in range(60)])
+    ref, x_ref = _qc_reference(x, mask)
+
+    adata = AnnData(x.copy(), var=var)
+    obs, var_df = sc.pp.calculate_qc_metrics(
+        adata, qc_vars=["mt"], percent_top=None, log1p=False
+    )
+    got = dict(
+        n_genes_by_counts=obs["n_genes_by_counts"],
+        total_counts=obs["total_counts"],
+        total_counts_mt=obs["total_counts_mt"],
+        n_cells_by_counts=var_df["n_cells_by_counts"],
+        mean_counts=var_df["mean_counts"],
+        total_counts_var=var_df["total_counts"],
+    )
+    for key, expected in ref.items():
+        actual = got[key].to_numpy()
+        assert actual.dtype == expected.dtype, key
+        np.testing.assert_array_equal(actual, expected, err_msg=key)
+    # X is changed in place exactly as the scipy code path changed it
+    for attr in ("data", "indices", "indptr"):
+        np.testing.assert_array_equal(getattr(adata.X, attr), getattr(x_ref, attr))
+
+    with sc.settings.override(reference_numerics=False):
+        obs_f, var_f = sc.pp.calculate_qc_metrics(
+            AnnData(x.copy(), var=var), qc_vars=["mt"], percent_top=None, log1p=False
+        )
+    rtol = 1e-5
+    for col in ("n_genes_by_counts", "total_counts", "total_counts_mt"):
+        np.testing.assert_allclose(obs_f[col], obs[col], rtol=rtol)
+    for col in ("n_cells_by_counts", "mean_counts", "total_counts"):
+        np.testing.assert_allclose(var_f[col], var_df[col], rtol=rtol)
+
+
+@pytest.mark.parametrize("deterministic", [True, False], ids=["det", "fast"])
+@pytest.mark.filterwarnings("ignore::pandas.errors.PerformanceWarning")
+def test_qc_metrics_many_qc_vars(*, deterministic: bool) -> None:
+    """More `qc_vars` than fit in the kernel's int64 bit flags fall back correctly."""
+    x = sparse.random(50, 80, density=0.3, format="csr", dtype=np.float64, rng=0)
+    var = pd.DataFrame(
+        {f"q{i}": np.arange(80) == i for i in range(70)},
+        index=[f"g{i}" for i in range(80)],
+    )
+    adata = AnnData(x, var=var)
+    with sc.settings.override(reference_numerics=deterministic):
+        obs, _ = sc.pp.calculate_qc_metrics(
+            adata, qc_vars=list(var.columns), percent_top=None
+        )
+    for i in (0, 63, 64, 69):
+        np.testing.assert_allclose(obs[f"total_counts_q{i}"], x[:, i].toarray().ravel())
+
+
+def _ragged_csr(
+    dtype: type, container: type, *, rng: np.random.Generator, n_vars: int = 4000
+):
+    """Rows of every length around numpy's pairwise-summation blocks (8, 128 and their multiples).
+
+    Values span orders of magnitude, so any other summation order changes the last bits.
+    Every tenth column stays empty.
+    """
+    special = [0, 1, 2, 7, 8, 9, 16, 17, 127, 128, 129, 130, 136, 255, 256, 257]
+    special += [258, 1000, 1031, 3000, 0, 5]
+    lengths = np.r_[special, rng.integers(0, 400, size=300)]
+    pool = np.flatnonzero(np.arange(n_vars) % 10 != 3)
+    indices = [np.sort(rng.choice(pool, size=n, replace=False)) for n in lengths]
+    data = rng.lognormal(0, 3, size=lengths.sum()).astype(dtype)
+    indptr = np.r_[0, np.cumsum(lengths)]
+    return container(
+        (data, np.concatenate(indices), indptr), shape=(len(lengths), n_vars)
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("container", [sparse.csr_matrix, sparse.csr_array])
+@pytest.mark.parametrize("n_threads", [1, 3, None], ids=["1", "3", "all"])
+def test_qc_metrics_reference_kernels_match_scipy(
+    dtype: type, container: type, n_threads: int | None
+) -> None:
+    """With `settings.reference_numerics`, float sums are bit-identical to scipy's, for any thread count.
+
+    Row sums are `np.add.reduceat` (pairwise summation), column sums sequential in row order.
+    """
+    from scanpy._utils import axis_nnz
+    from scanpy._utils._numba import _numba_thread_limit
+
+    rng = np.random.default_rng(0)
+    x = _ragged_csr(dtype, container, rng=rng)
+    n_vars = x.shape[1]
+    masks = dict(
+        few=np.isin(np.arange(n_vars), rng.choice(n_vars, 40, replace=False)),
+        many=rng.random(n_vars) < 0.8,  # long masked rows: pairwise blocks too
+        none=np.zeros(n_vars, dtype=bool),
+    )
+    ref = x.copy()
+    expected_obs = dict(
+        n_genes_by_counts=axis_nnz(ref, axis=1),
+        total_counts=stats.sum(ref, axis=1),
+        **{f"total_counts_{k}": stats.sum(ref[:, m], axis=1) for k, m in masks.items()},
+    )
+    expected_var = dict(
+        n_cells_by_counts=axis_nnz(ref, axis=0),
+        mean_counts=stats.mean(ref, axis=0),
+        total_counts=stats.sum(ref, axis=0),
+    )
+
+    adata = AnnData(x, var=pd.DataFrame(masks, index=[f"g{i}" for i in range(n_vars)]))
+    with _numba_thread_limit(n_threads):
+        obs, var = sc.pp.calculate_qc_metrics(
+            adata, qc_vars=list(masks), percent_top=None, log1p=False
+        )
+    for df, expected in ((obs, expected_obs), (var, expected_var)):
+        for key, e in expected.items():
+            actual = df[key].to_numpy()
+            assert actual.dtype == e.dtype, key
+            np.testing.assert_array_equal(actual, e, err_msg=key)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_qc_metrics_reference_non_bool_qc_var(dtype: type) -> None:
+    """A non-boolean qc_var column indexes genes by value in scipy: the reference path keeps that."""
+    x = sparse.random(50, 20, density=0.5, format="csr", dtype=dtype, rng=0)
+    flags = (np.arange(20) < 3).astype(np.int64)  # as indices: gene 1 three times, gene 0 17 times
+    adata = AnnData(x, var=pd.DataFrame({"q": flags}, index=[f"g{i}" for i in range(20)]))
+    obs, _ = sc.pp.calculate_qc_metrics(adata, qc_vars=["q"], percent_top=None)
+    np.testing.assert_array_equal(
+        obs["total_counts_q"].to_numpy(), stats.sum(x[:, flags], axis=1)
+    )

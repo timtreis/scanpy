@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     from numpy.typing import NDArray
 
-    from scanpy._compat import DaskArray
+    from scanpy._compat import CSRBase, DaskArray
 
 
 # TODO: Report more context on the fields being compared on error
@@ -185,3 +185,9 @@ def random_mask(n: int, *, rng: np.random.Generator | None = None) -> NDArray[np
     if (n_true := mask.sum()) < 2:
         mask[rng.choice(np.flatnonzero(~mask), 2 - n_true, replace=False)] = True
     return mask
+
+
+def with_duplicates(x: CSRBase, *, split: bool = True) -> CSRBase:
+    """`x` with every stored entry stored twice, adjacently (halved if `split`, so sums are unchanged)."""
+    data = np.repeat(x.data / 2 if split else x.data, 2)
+    return type(x)((data, np.repeat(x.indices, 2), x.indptr * 2), shape=x.shape)

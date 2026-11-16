@@ -12,6 +12,7 @@ from ... import logging as log
 from ..._compat import warn
 from ..._settings import settings
 from ..._settings.verbosity import Verbosity
+from ..._utils._numba import N_REDUCE_CHUNKS as N_CHUNKS
 from ..._utils.random import _legacy_random_state
 from ._kernels import _apply_correction, _cluster_pass, _joint_stats
 
@@ -41,8 +42,6 @@ STOP_RULES = {
     "paper_window3": (3, True),
 }
 SEEDINGS = ("afkmc2", "kmeans", "kmeans++", "paper_nearest")
-# Fixed number of static chunks per parallel sweep, so results do not depend on the thread count.
-N_CHUNKS = 32
 # clusters per batched solve of the correction; bounds its dense systems
 _SOLVE_CHUNK = 8
 
