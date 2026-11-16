@@ -387,3 +387,230 @@ def test_leiden_key_added_deprecated(
     assert key in adata_neighbors.obs
     assert adata_neighbors.obs.keys().equals(expected.obs.keys())
     assert adata_neighbors.uns.keys() == expected.uns.keys()
+
+
+@pytest.mark.parametrize(
+    "flavor",
+    [
+        pytest.param("igraph", marks=needs.igraph),
+        pytest.param("networkit", marks=needs.networkit),
+    ],
+)
+@pytest.mark.parametrize("restrict", [False, True], ids=["plain", "restrict"])
+def test_leiden_multi_resolution_keys(
+    adata_neighbors: AnnData, flavor: str, *, restrict: bool
+) -> None:
+    """Every flavor accepts several resolutions; default keys have no dots."""
+    kw = dict(restrict_to=("louvain", ["0"])) if restrict else {}
+    sc.tl.leiden(
+        adata_neighbors, resolution=np.array([0.25, 1.0]), flavor=flavor, rng=0, **kw
+    )
+    base = "leiden_R" if restrict else "leiden"
+    for key, res in [(f"{base}_res0_25", 0.25), (f"{base}_res1", 1.0)]:
+        assert adata_neighbors.obs[key].dtype == "category"
+        assert adata_neighbors.uns[key]["params"]["resolution"] == res
+        assert "modularity" in adata_neighbors.uns[key]
+    assert base not in adata_neighbors.obs
+
+
+@pytest.fixture(params=[pytest.param("igraph", marks=needs.igraph)])
+def multi_flavor(request: pytest.FixtureRequest) -> Literal["igraph"]:
+    """The default flavor, for the multi-resolution API."""
+    return request.param
+
+
+@needs.anndata_acc
+def test_leiden_multi_resolution_out_mapping(
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+) -> None:
+    from anndata.acc import A
+
+    obs_before = set(adata_neighbors.obs)
+    ret = sc.tl.leiden(
+        adata_neighbors,
+        resolution=[0.5, 2],
+        flavor=multi_flavor,
+        out={2.0: A.obs["fine"], 0.5: "obs.coarse"},
+    )
+    assert ret is None
+    assert set(adata_neighbors.obs) - obs_before == {"fine", "coarse"}
+    assert adata_neighbors.uns["coarse"]["params"]["resolution"] == 0.5
+    assert adata_neighbors.uns["fine"]["params"]["resolution"] == 2.0
+    assert (
+        adata_neighbors.obs["coarse"].nunique() < adata_neighbors.obs["fine"].nunique()
+    )
+
+
+def test_leiden_multi_resolution_out_true(
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+) -> None:
+    """Returns a dict, and a resolution within a sequence gives what it gives alone."""
+    from typing import assert_type
+
+    obs_before, uns_before = adata_neighbors.obs.copy(), set(adata_neighbors.uns)
+    multi = sc.tl.leiden(
+        adata_neighbors, resolution=[0.5, 1, 2], flavor=multi_flavor, rng=0, out=True
+    )
+    assert_type(multi, dict[float, pd.Categorical])
+    assert list(multi) == [0.5, 1.0, 2.0]
+    assert all(isinstance(v, pd.Categorical) for v in multi.values())
+    for res in [1, 2]:
+        single = sc.tl.leiden(
+            adata_neighbors, resolution=res, flavor=multi_flavor, rng=0, out=True
+        )
+        assert_type(single, pd.Categorical)
+        assert list(single) == list(multi[res])
+    pd.testing.assert_frame_equal(adata_neighbors.obs, obs_before)
+    assert set(adata_neighbors.uns) == uns_before
+
+
+@needs.igraph
+@pytest.mark.parametrize(
+    ("resolution", "keys"),
+    [
+        pytest.param(
+            np.arange(0.1, 0.4, 0.1),  # 0.30000000000000004
+            ["leiden_res0_1", "leiden_res0_2", "leiden_res0_3"],
+            id="arange",
+        ),
+        pytest.param([1e-5, 2.0], ["leiden_res0_00001", "leiden_res2"], id="small"),
+        pytest.param([-0.0, 1], ["leiden_res0", "leiden_res1"], id="neg-zero"),
+        pytest.param(
+            np.array([0.1, 0.5], np.float32),
+            ["leiden_res0_1", "leiden_res0_5"],
+            id="float32",
+        ),
+    ],
+)
+def test_leiden_multi_resolution_key_names(
+    adata_neighbors: AnnData, resolution: list[float] | np.ndarray, keys: list[str]
+) -> None:
+    """Keys are rounded, positional and have no `-`; `uns` keeps the value as given."""
+    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="igraph", rng=0)
+    for key, res in zip(keys, np.asarray(resolution).tolist(), strict=True):
+        assert key in adata_neighbors.obs
+        assert adata_neighbors.uns[key]["params"]["resolution"] == pytest.approx(res)
+
+
+@needs.anndata_acc
+@needs.igraph
+def test_leiden_multi_resolution_float32(adata_neighbors: AnnData) -> None:
+    """float32 resolutions are taken as written, so `out` and the result use those values."""
+    from anndata.acc import A
+
+    res = np.array([0.1, 0.5], np.float32)
+    multi = sc.tl.leiden(
+        adata_neighbors, resolution=res, flavor="igraph", rng=0, out=True
+    )
+    assert list(multi) == [0.1, 0.5]
+    alone = sc.tl.leiden(
+        adata_neighbors, resolution=0.1, flavor="igraph", rng=0, out=True
+    )
+    assert list(multi[0.1]) == list(alone)
+    sc.tl.leiden(
+        adata_neighbors,
+        resolution=res,
+        flavor="igraph",
+        rng=0,
+        out={0.1: A.obs["a"], 0.5: A.obs["b"]},
+    )
+    assert adata_neighbors.uns["a"]["params"]["resolution"] == 0.1
+
+
+@needs.anndata_acc
+def test_leiden_multi_resolution_restrict_reads_input(
+    adata_neighbors: AnnData, multi_flavor: Literal["igraph"]
+) -> None:
+    """With `restrict_to`, every resolution relabels the column as it was before the call."""
+    from anndata.acc import A
+
+    kw = dict(
+        resolution=[0.5, 1],
+        flavor=multi_flavor,
+        rng=0,
+        restrict_to=("louvain", ["0", "1"]),
+    )
+    expected = sc.tl.leiden(adata_neighbors.copy(), out=True, **kw)
+    # the first result overwrites the restricted column
+    sc.tl.leiden(adata_neighbors, out={0.5: A.obs["louvain"], 1: A.obs["fine"]}, **kw)
+    assert list(adata_neighbors.obs["louvain"]) == list(expected[0.5])
+    assert list(adata_neighbors.obs["fine"]) == list(expected[1.0])
+
+
+@needs.anndata_acc
+@pytest.mark.parametrize(
+    ("kwargs", "exc", "match"),
+    [
+        pytest.param(
+            dict(resolution=[0.3, 0.1 + 0.2]), ValueError, r"same key", id="key-clash"
+        ),
+        pytest.param(dict(resolution=[]), ValueError, r"empty", id="empty"),
+        pytest.param(dict(resolution=[1, 1.0]), ValueError, r"distinct", id="dupe"),
+        pytest.param(
+            dict(resolution=[0.5, np.nan]), ValueError, r"finite", id="nan"
+        ),
+        pytest.param(
+            dict(resolution=np.ones((2, 2))), ValueError, r"1-dimensional", id="2d"
+        ),
+        pytest.param(
+            dict(resolution=[0.5, 1], out="obs.k"),
+            TypeError,
+            r"mapping from each resolution",
+            id="single-acc",
+        ),
+        pytest.param(
+            dict(resolution=[0.5, 1], out={0.5: "obs.a"}),
+            TypeError,
+            r"missing \[1\.0\]",
+            id="mapping-missing",
+        ),
+        pytest.param(
+            dict(resolution=[0.5, 1], out={0.5: "obs.a", 1: "obs.b", 2: "obs.c"}),
+            TypeError,
+            r"aren’t in `resolution`",
+            id="mapping-unknown",
+        ),
+        pytest.param(
+            dict(resolution=[0.5, 1], out={0.5: "obs.a", 1: "obs.a"}),
+            ValueError,
+            r"same column",
+            id="mapping-same-dest",
+        ),
+        pytest.param(
+            dict(resolution=[0.5, 1], out={0.5: "obs.a", 1.0: True}),
+            TypeError,
+            r"map resolutions to accessors",
+            id="mapping-bool",
+        ),
+        pytest.param(
+            dict(resolution=1, out={1: "obs.a"}),
+            TypeError,
+            r"needs a sequence",
+            id="mapping-scalar",
+        ),
+    ],
+)
+def test_leiden_resolution_errors(
+    adata_neighbors: AnnData,
+    multi_flavor: Literal["igraph"],
+    kwargs: dict,
+    exc: type[Exception],
+    match: str,
+) -> None:
+    obs_before = set(adata_neighbors.obs)
+    with pytest.raises(exc, match=match):
+        sc.tl.leiden(adata_neighbors, flavor=multi_flavor, **kwargs)
+    assert set(adata_neighbors.obs) == obs_before
+
+
+@needs.igraph
+@pytest.mark.parametrize(
+    "resolution", [1, np.array(1.0)], ids=["int", "0d-array"]
+)
+def test_leiden_scalar_resolution_unchanged(
+    adata_neighbors: AnnData, resolution: float | np.ndarray
+) -> None:
+    obs_before = set(adata_neighbors.obs)
+    sc.tl.leiden(adata_neighbors, resolution=resolution, flavor="igraph", rng=0)
+    assert set(adata_neighbors.obs) - obs_before == {"leiden"}
+    assert adata_neighbors.uns["leiden"]["params"]["resolution"] is resolution
