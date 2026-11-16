@@ -818,7 +818,7 @@ def _planted_graph(n: int = 20_000, *, hub: bool = False):
 def test_leiden_numba_schedules_identical(
     monkeypatch: pytest.MonkeyPatch, *, hub: bool
 ) -> None:
-    """Memberships don’t depend on the thread or chunk count or the table size.
+    """Memberships don’t depend on the schedule, thread or chunk count, table size or memory budget.
 
     "hashed" tables are smaller than the graph, so vertices, clusters and rows above their key
     limit (the hub, aggregated levels) take the dense table; "tiny" sends nearly everything there.
@@ -831,6 +831,7 @@ def test_leiden_numba_schedules_identical(
     graph, res = _planted_graph(hub=hub), [0.5, 1.0, 2.0]
     ref = ln.leiden(graph, res)[0]
     assert all(len(np.unique(m)) > 1 for m in ref)
+    modes = ["seq", "outer"] + (["concurrent"] if ln._concurrent_launches_ok() else [])
     threads = sorted({1, min(3, numba.config.NUMBA_NUM_THREADS)})
     tables = dict(
         dense=(ln._TABLE_MIN, ln._TABLE_MAX), hashed=(1 << 10, 1 << 10), tiny=(4, 4)
@@ -839,16 +840,103 @@ def test_leiden_numba_schedules_identical(
     for name, (lo, hi) in tables.items():
         monkeypatch.setattr(ln, "_TABLE_MIN", lo)
         monkeypatch.setattr(ln, "_TABLE_MAX", hi)
-        for n_threads in threads:
-            with _numba_thread_limit(n_threads):
-                results[name, n_threads] = ln.leiden(graph, res)[0]
+        for mode in modes:
+            monkeypatch.setattr(ln, "_schedule", lambda *_, mode=mode, **__: mode)
+            for n_threads in threads:
+                with _numba_thread_limit(n_threads):
+                    results[name, mode, n_threads] = ln.leiden(graph, res)[0]
     monkeypatch.setattr(ln, "_TABLE_MIN", 1 << 10)
     monkeypatch.setattr(ln, "_TABLE_MAX", 1 << 10)
+    monkeypatch.setattr(ln, "_schedule", lambda *_, **__: "seq")
     with monkeypatch.context() as m:
         m.setattr(ln, "_serial_only", lambda: True)  # the serial chain
         results["serial"] = ln.leiden(graph, res)[0]
+    # no budget: outer/concurrent fall back to seq with one chunk per thread, as on huge graphs
+    sc.settings.max_memory = 0
+    monkeypatch.setattr(ln, "_OUTER", lambda *_: pytest.fail("outer ran over budget"))
+    for mode in modes[1:]:
+        monkeypatch.setattr(ln, "_schedule", lambda *_, mode=mode, **__: mode)
+        results["low_mem", mode] = ln.leiden(graph, res)[0]
     for name, memb in results.items():
         np.testing.assert_array_equal(memb, ref, err_msg=str(name))
+
+
+def test_leiden_numba_concurrent_shares_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "concurrent" schedule runs min(resolutions, threads) workers that split the threads."""
+    import threading
+
+    import numba
+
+    from scanpy._utils import _numba_thread_limit
+    from scanpy.tools import _leiden_numba as ln
+
+    if not ln._concurrent_launches_ok():
+        pytest.skip("the threading layer can’t launch parallel kernels from several threads")
+    n_threads = min(3, numba.config.NUMBA_NUM_THREADS)
+    if n_threads < 2:
+        pytest.skip("needs at least 2 numba threads")
+    set_num_threads, calls = numba.set_num_threads, []
+
+    def record(k: int) -> None:
+        calls.append((threading.current_thread().name, k))
+        set_num_threads(k)
+
+    graph = _planted_graph(2000)
+    with _numba_thread_limit(n_threads):
+        monkeypatch.setattr(numba, "set_num_threads", record)
+        monkeypatch.setattr(ln, "_schedule", lambda *_, **__: "concurrent")
+        ln.leiden(graph, np.linspace(0.2, 2, 7))
+        monkeypatch.undo()
+    workers = [k for name, k in calls if name.startswith("leiden")]
+    assert len(workers) == n_threads  # min(7, n_threads)
+    assert sum(workers) == n_threads
+
+
+@pytest.mark.parametrize("mode", ["seq", "concurrent", "outer"])
+def test_leiden_numba_plan(mode: str) -> None:
+    """A plan fits the budget, else falls back to "seq", whose last resort is one chunk per thread."""
+    from scanpy.tools import _leiden_numba as ln
+
+    kw = dict(n=10_000, nnz=200_000, maxdeg=60, nr=5, n_threads=8)
+    full = ln._plan(mode, **kw, budget=np.inf)
+    assert (full.mode, full.workers) == (mode, 1 if mode == "seq" else 5)
+    seq = ln._plan("seq", **kw, budget=np.inf)
+    for budget in [full.nbytes, full.nbytes - 1, seq.nbytes, seq.nbytes - 1, 0]:
+        plan = ln._plan(mode, **kw, budget=budget)
+        assert plan == full if budget >= full.nbytes else plan.mode == "seq"
+        if plan.nbytes > budget:
+            assert (plan.mode, plan.chunks) == ("seq", kw["n_threads"])
+
+
+def test_leiden_numba_plan_at_scale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At 10M vertices and 192 threads, the chunk tables add little to the workspace."""
+    from scanpy.tools import _leiden_numba as ln
+
+    kw = dict(n=10_000_000, nnz=200_000_000, maxdeg=500, nr=1, n_threads=192)
+    plan = ln._plan("seq", **kw, budget=np.inf)
+    assert plan.slots < kw["n"]  # hashed
+    assert plan.nbytes < 7e9  # 5.5 GB per vertex and edge, 0.6 GB of tables
+    # dense tables, as before hashing
+    monkeypatch.setattr(ln, "_TABLE_MIN", 1 << 40)
+    monkeypatch.setattr(ln, "_TABLE_MAX", 1 << 40)
+    assert ln._plan("seq", **kw, budget=np.inf).nbytes > 6e10
+
+
+def test_leiden_numba_budget() -> None:
+    """The workspace budget is `settings.max_memory`, at most half the physical memory."""
+    import os
+
+    from scanpy.tools import _leiden_numba as ln
+
+    sc.settings.max_memory = 2
+    assert ln._budget() <= 2e9
+    sc.settings.max_memory = 1e12  # more than any machine has
+    try:
+        ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        assert ln._budget() == sc.settings.max_memory * 1e9
+    else:
+        assert ln._budget() == ram / 2
 
 
 def test_leiden_numba_unknown_argument(adata_neighbors: AnnData) -> None:

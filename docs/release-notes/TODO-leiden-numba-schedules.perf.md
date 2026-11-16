@@ -1,0 +1,1 @@
+Speed up {func}`~scanpy.tl.leiden` with `flavor="numba"` and several resolutions by clustering them at the same time where their workspaces fit in {attr}`scanpy.settings.max_memory`, with identical results {smaller}`T Treis`

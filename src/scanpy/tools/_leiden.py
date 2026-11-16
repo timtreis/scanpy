@@ -225,7 +225,9 @@ def leiden(  # noqa: PLR0913
         A sequence (or 1-dimensional array) clusters at each resolution.
         Each resolution gives the same clusters as when it is passed alone with the same `rng`
         (for `'networkit'` with several threads, as similar ones).
-        Resolutions run one after another.
+        `flavor='numba'` runs several resolutions at once where its workspaces fit in
+        :attr:`scanpy.settings.max_memory` (and half the physical memory),
+        otherwise one after another, each in parallel; the other flavors run one after another.
         Resolutions are compared as :class:`float`\ s and must be distinct and finite;
         float32 values are taken as written (`0.1`, not `0.10000000149011612`).
         By default (`out=False`) each result goes to `.obs` and `.uns` under

@@ -24,30 +24,38 @@ communities than its chunk's table holds is summed afterwards, serially, in one 
 Either way each community's sum adds the same weights in the same order, and communities are
 listed in the order they are first met, so the tables don't change results.
 
-Several resolutions run one after another, each with parallel kernels.
+Several resolutions run one after another with parallel kernels ("seq"), from a few Python threads
+that split the threads between them ("concurrent", where the threading layer allows it), or one
+per thread with serial kernels ("outer"); see `_schedule` and `_plan`.
 
 A partition depends only on (graph, resolution, seed, n_iterations, beta): not on the number of
-threads, on how work is chunked, on the table sizes, or on which other
+threads, on how work is chunked, on the table sizes, on the schedule, or on which other
 resolutions are computed in the same call.
 """
 
 from __future__ import annotations
 
+import os
 import types
+from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 import numba
 import numpy as np
 
 from .._compat import warn
+from .._settings import settings
 from .._utils._numba import _mix
 
 _MAX_ITERATIONS = 1000  # read at call time and passed to the kernels, so tests can lower it
 _MAX_ROUNDS = 1000  # local-moving rounds per level: stale totals within a class could in principle cycle
 _SMALL = 512  # below this many vertices, a parallel launch costs more than it saves
 _NO_LIMIT = 1 << 62  # the key limit of a dense table
-# Slots per chunk table, powers of two (read at call time by `_table_slots`); a graph with
-# fewer vertices gets dense tables. 2**16 slots of 16 B are 1 MiB, so 384 chunks hold 0.4 GB.
+# Slots per chunk table, powers of two (read at call time by `_plan`); a graph with fewer vertices
+# gets dense tables. 2**16 slots of 16 B are 1 MiB, so 384 chunks hold 0.4 GB.
 _TABLE_MIN, _TABLE_MAX = 1 << 16, 1 << 20
+_TABLE_SLOT_BYTES = 4 + 8 + 4  # key, sum and insertion-list entry
+_RAM_SHARE = 0.5  # at most this share of the physical memory goes to workspaces
 # Helpers called only from jitted code. fau's `njit` returns a Python dispatcher that jitted
 # callers can't call, and has no `inline=`; these are compiled into each caller's variant.
 _sjit = numba.njit(cache=True, nogil=True)  # noqa: TID251 (callee-only, see above)
@@ -67,6 +75,9 @@ _ijit = numba.njit(cache=True, nogil=True, inline="always")  # noqa: TID251 (cal
 # tkey/tval/tlst (nch, slots): one hash table per chunk; bkey/bval/blst (n+1, or 1 when the chunk
 # tables are dense): the dense table for deferred items.
 _NWS_I, _NWS_F, _NWS_B = 21, 7, 2
+# Bytes held per workspace: ws_i/ws_f/ws_b per vertex, idx_buf/w_buf per stored edge; see `_plan`.
+_WS_VERTEX_BYTES = 8 * _NWS_I + 8 * _NWS_F + _NWS_B  # 226
+_WS_EDGE_BYTES = 2 * (4 + 4)
 
 
 # ---------------------------------------------------------------- random numbers and small helpers
@@ -686,6 +697,31 @@ def _leiden_one(g0, resolution, res_bits, params, memb_out, capped, ws):  # noqa
                 break
 
 
+def _leiden_outer(g0, res, res_bits, params, out, capped, ws):  # noqa: PLR0917
+    """All resolutions, dealt round-robin to the workspaces (leading axis of each array in ws), one per thread."""
+    idx_buf, w_buf, ws_i, ws_f, ws_b, ws_u, tkey, tval, tlst, bkey, bval, blst = ws
+    nb, nr = ws_i.shape[0], res.shape[0]
+    for j in numba.prange(nb):
+        wj = (
+            idx_buf[j],
+            w_buf[j],
+            ws_i[j],
+            ws_f[j],
+            ws_b[j],
+            ws_u[j],
+            tkey[j],
+            tval[j],
+            tlst[j],
+            bkey[j],
+            bval[j],
+            blst[j],
+        )
+        for r in range(j, nr, nb):
+            _leiden_one(
+                g0, res[r], res_bits[r], params, out[r], capped[r : r + 1], wj
+            )
+
+
 # ---------------------------------------------------------------- compiled variants
 _CHAIN = (
     "_propose",
@@ -693,19 +729,25 @@ _CHAIN = (
     "_refine",
     "_aggregate",
     "_leiden_one",
+    "_leiden_outer",
 )
 
 
-def _variant(kind: str, *, parallel: bool) -> dict:
+def _variant(kind: str, *, parallel: bool, nested: dict | None = None) -> dict:
     """Compile the chain with callees bound to this variant; distinct qualnames keep numba's caches apart.
+
+    `nested` supplies already-compiled callees (the outer prange over resolutions calls serial kernels).
 
     fau's `njit` also makes a parallel and a serial copy, but both copies share the module's
     globals, so a jitted caller would see the module-level callees (fau's Python dispatchers,
-    which jitted code can't call). Each variant here gets its own globals instead. Compilation
-    is lazy and disk-cached; a cold cache compiles up to two chains (par and ser).
+    which jitted code can't call), and the outer variant couldn't get serial callees inside a
+    parallel kernel. Each variant here gets its own globals instead. Compilation is lazy and
+    disk-cached; a cold cache compiles up to three chains (par, ser, and outer on top of ser).
     """
     g = dict(globals())
-    for name in _CHAIN:
+    if nested is not None:
+        g.update({k: nested[k] for k in _CHAIN if k != "_leiden_outer"})
+    for name in _CHAIN if nested is None else ("_leiden_outer",):
         f = globals()[name]
         fn = types.FunctionType(
             f.__code__, g, f.__name__, f.__defaults__, f.__closure__
@@ -717,9 +759,18 @@ def _variant(kind: str, *, parallel: bool) -> dict:
 
 _PAR = _variant("par", parallel=True)
 _SER = _variant("ser", parallel=False)
+_OUTER = _variant("outer", parallel=True, nested=_SER)["_leiden_outer"]
 
 
 # ---------------------------------------------------------------- scheduling and memory
+def _concurrent_launches_ok() -> bool:
+    """Whether parallel kernels may be launched from several threads."""
+    from fast_array_utils.numba import LAYERS
+
+    numba.get_num_threads()  # launches the threading layer, which `threading_layer()` needs
+    return numba.threading_layer() in LAYERS["threadsafe"]
+
+
 def _serial_only() -> bool:
     """fast-array-utils' checks for where parallel numba kernels are unsafe (non-main thread, forks)."""
     from fast_array_utils import numba as fau_numba
@@ -729,6 +780,32 @@ def _serial_only() -> bool:
         for name in ("_is_on_unsafe_thread", "_is_in_unsafe_fork")
     )
     return any(check() for check in checks if check is not None)
+
+
+def _schedule(nr: int, n_threads: int, *, serial: bool) -> str:
+    """Pick how to run `nr` resolutions.
+
+    "seq": one at a time with parallel kernels; "concurrent": min(nr, n_threads) at a time from
+    Python threads that split the threads, where the threading layer allows it; else "outer":
+    min(nr, n_threads) at a time, one per thread, with serial kernels.
+    """
+    if serial or nr == 1 or n_threads == 1:
+        return "seq"
+    return "concurrent" if _concurrent_launches_ok() else "outer"
+
+
+def _budget() -> float:
+    """Bytes for Leiden's workspaces: :attr:`scanpy.settings.max_memory` (in GB), capped at half the physical memory.
+
+    The physical memory comes from `os.sysconf` where it exists (not on Windows). It is the
+    machine's, not a container's or batch job's, so `max_memory` is the setting to lower there.
+    """
+    budget = settings.max_memory * 1e9
+    try:
+        ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return budget
+    return min(budget, _RAM_SHARE * ram)
 
 
 def _table_slots(n: int, maxdeg: int) -> int:
@@ -741,41 +818,110 @@ def _table_slots(n: int, maxdeg: int) -> int:
     return n + 1 if slots > n else slots
 
 
-def _run(g, res, params, *, serial: bool) -> tuple[np.ndarray, np.ndarray]:
-    """Run the resolutions one after another; returns the raw memberships and the capped flags.
+class _Plan(NamedTuple):
+    mode: str  # "seq", "concurrent" or "outer"
+    workers: int  # workspaces, each running one resolution at a time
+    chunks: int  # chunk tables per workspace
+    slots: int  # slots per chunk table; n + 1: dense
+    nbytes: int  # all workspaces
 
-    One workspace, with 2 chunk tables per thread of `_table_slots` slots each.
+
+def _plan(  # noqa: PLR0913
+    mode: str, *, n: int, nnz: int, maxdeg: int, nr: int, n_threads: int, budget: float
+) -> _Plan:
+    """Fit `mode`'s workspaces into `budget` bytes, else fall back to "seq".
+
+    "seq" holds one workspace with 2 chunk tables per thread; "concurrent" min(nr, n_threads), with
+    2 chunk tables per thread of a worker's share; "outer" min(nr, n_threads) with one dense table
+    each (its kernels are serial). A workspace is `_WS_VERTEX_BYTES` per vertex and
+    `_WS_EDGE_BYTES` per stored edge, plus `_TABLE_SLOT_BYTES` per table slot: the chunk tables
+    (`_table_slots`), and the dense table for deferred items when the chunk tables aren't dense.
+    Neither the schedule nor the chunk or slot counts change results, so large graphs trade
+    concurrency for memory. Below one chunk per thread in "seq" the budget is exceeded rather than
+    parallelism lost; the chunk tables are small next to the per-vertex workspace.
     """
-    n, nr = g.shape[0], res.shape[0]
-    chunks = 2 * numba.get_num_threads()
-    slots = _table_slots(n, int(np.diff(g.indptr).max()))
+    slots = _table_slots(n, maxdeg)
+    workers = min(nr, n_threads)
+
+    def plan(mode: str, workers: int, chunks: int, slots: int) -> _Plan:
+        dense = n + 1 if slots <= n else 0
+        tables = _TABLE_SLOT_BYTES * (chunks * slots + dense)
+        per = _WS_VERTEX_BYTES * (n + 1) + _WS_EDGE_BYTES * nnz + tables
+        return _Plan(mode, workers, chunks, slots, workers * per)
+
+    p = None
+    if mode == "outer":
+        p = plan(mode, workers, 1, n + 1)
+    elif mode == "concurrent":
+        p = plan(mode, workers, 2 * -(-n_threads // workers), slots)
+    if p is None or p.nbytes > budget:
+        p = plan("seq", 1, 2 * n_threads, slots)
+        if p.nbytes > budget:
+            p = plan("seq", 1, n_threads, slots)
+    return p
+
+
+def _run(
+    g, res, params, plan: _Plan, *, serial: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run every resolution as `plan` says; returns the raw memberships and the capped flags."""
+    n, nr, nb = g.shape[0], res.shape[0], plan.workers
     g0 = (
         g.indptr.astype(np.int64, copy=False),
         g.indices.astype(np.int32, copy=False),
         g.data,
     )
-    shape = (chunks, slots)
-    dense = n + 1 if slots <= n else 1  # unused with dense chunk tables
+    shape = (nb, plan.chunks, plan.slots)
+    dense = n + 1 if plan.slots <= n else 1  # unused with dense chunk tables
     ws = (
-        np.empty((2, g.nnz), np.int32),
-        np.empty((2, g.nnz), np.float32),
-        np.empty((_NWS_I, n + 1), np.int64),
-        np.empty((_NWS_F, n + 1), np.float64),
-        np.zeros((_NWS_B, n + 1), np.bool),
-        np.empty(chunks + 1, np.uint64),
+        np.empty((nb, 2, g.nnz), np.int32),
+        np.empty((nb, 2, g.nnz), np.float32),
+        np.empty((nb, _NWS_I, n + 1), np.int64),
+        np.empty((nb, _NWS_F, n + 1), np.float64),
+        np.zeros((nb, _NWS_B, n + 1), np.bool),
+        np.empty((nb, plan.chunks + 1), np.uint64),
         np.full(shape, -1, np.int32),  # tables: empty on entry and exit
         np.zeros(shape, np.float64),
         np.empty(shape, np.int32),
-        np.full(dense, -1, np.int32),
-        np.zeros(dense, np.float64),
-        np.empty(dense, np.int32),
+        np.full((nb, dense), -1, np.int32),
+        np.zeros((nb, dense), np.float64),
+        np.empty((nb, dense), np.int32),
     )
     out = np.empty((nr, n), dtype=np.int64)
     capped = np.zeros(nr, dtype=np.bool)
     bits = res.view(np.uint64)
+    if plan.mode == "outer":
+        _OUTER(g0, res, bits, params, out, capped, ws)
+        return out, capped
     one = (_SER if serial else _PAR)["_leiden_one"]
-    for r in range(nr):
-        one(g0, res[r], bits[r], params, out[r], capped[r : r + 1], ws)
+
+    def args(r: int, j: int) -> tuple:
+        return (
+            g0,
+            res[r],
+            bits[r],
+            params,
+            out[r],
+            capped[r : r + 1],
+            tuple(a[j] for a in ws),
+        )
+
+    if plan.mode == "seq":
+        for r in range(nr):
+            one(*args(r, 0))
+        return out, capped
+    # concurrent: nb workers split the caller's threads, so they run about n_threads in total
+    n_threads = numba.get_num_threads()
+
+    def work(j: int) -> None:
+        numba.set_num_threads(n_threads // nb + (j < n_threads % nb))  # thread-local
+        for r in range(j, nr, nb):
+            one(*args(r, j))
+
+    if not one.signatures:  # compile (or load from cache) once, not in every thread
+        one.compile(tuple(numba.typeof(a) for a in args(0, 0)))
+    with ThreadPoolExecutor(nb, thread_name_prefix="leiden") as pool:
+        list(pool.map(work, range(nb)))
     return out, capped
 
 
@@ -811,7 +957,7 @@ def leiden(
     array (n_res,). Edge weights must be non-negative and resolutions non-negative and finite, as
     igraph's modularity requires; `beta` must be finite and positive. A graph without edges (or
     only zero weights) gives singletons and NaN modularity, as igraph does. Threads come from
-    `numba.get_num_threads()`.
+    `numba.get_num_threads()`, memory from `_budget`.
     """
     import scipy.sparse as sp
 
@@ -842,9 +988,20 @@ def leiden(
     # no edges (with non-negative weights, the only way the total weight isn't positive)
     if g.nnz == 0:
         return np.tile(np.arange(n, dtype=np.int32), (nr, 1)), np.full(nr, np.nan)
+    n_threads = numba.get_num_threads()
+    serial = _serial_only()
+    plan = _plan(
+        _schedule(nr, n_threads, serial=serial),
+        n=n,
+        nnz=g.nnz,
+        maxdeg=int(np.diff(g.indptr).max()),
+        nr=nr,
+        n_threads=n_threads,
+        budget=_budget(),
+    )
     params = (float(beta), int(n_iterations), int(_MAX_ITERATIONS), int(seed))
     # the workspaces are freed when `_run` returns, before the modularities are computed
-    out, capped = _run(g, res, params, serial=_serial_only())
+    out, capped = _run(g, res, params, plan, serial=serial)
     if capped.any():
         msg = (
             f"Leiden didn’t converge within {_MAX_ITERATIONS} iterations "
