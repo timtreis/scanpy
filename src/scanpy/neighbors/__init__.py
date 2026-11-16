@@ -38,6 +38,7 @@ from ..get._use import _resolve_obs
 from . import _connectivity
 from ._common import (
     NEIGHBORS_KINDS,
+    _fit_transform,
     _get_indices_distances_from_dense_matrix,
     _get_indices_distances_from_sparse_matrix,
     _get_metadata,
@@ -623,6 +624,7 @@ class Neighbors:
             metric_params=metric_kwds,  # most use _params, not _kwds
             **({} if rng is None else dict(rng=np.random.default_rng(rng))),
         )
+        made_here = transformer is None or isinstance(transformer, str)
         method, transformer, shortcut = self._handle_transformer(
             method, transformer, knn=knn, kwds=transformer_kwds_default
         )
@@ -640,7 +642,7 @@ class Neighbors:
         if isinstance(x, HasArrayNamespace):
             # sklearn transformers require numpy, so need to convert at boundary
             x = np.asarray(x)
-        self._distances = transformer.fit_transform(x)
+        self._distances = _fit_transform(transformer, x, discarded=made_here)
         knn_indices, knn_distances = _get_indices_distances_from_sparse_matrix(
             self._distances, n_neighbors
         )

@@ -530,3 +530,48 @@ def test_umap_connectivities_match_umap_learn(
     )[0].tocsr()
     actual = umap(idx, dist, n_obs=n, n_neighbors=k, **kw)
     assert (actual != expected).nnz == 0
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_pynndescent_cache_bit_identical(
+    metric: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pynndescent.pynndescent_ as p
+    from pynndescent import NNDescent
+
+    from scanpy.neighbors._backends._pynndescent_cache import _stock, enable
+
+    if not enable():
+        pytest.skip("untested pynndescent version: stock code is used")
+    x = np.random.default_rng(0).normal(size=(5000, 20)).astype(np.float32)
+    kw = dict(n_neighbors=15, metric=metric, random_state=0, n_jobs=1)
+    patched = NNDescent(x, **kw).neighbor_graph
+    monkeypatch.setattr(p, "nn_descent", _stock()["nn_descent"])
+    stock = NNDescent(x, **kw).neighbor_graph
+    np.testing.assert_array_equal(patched[0], stock[0])
+    np.testing.assert_array_equal(patched[1], stock[1])
+
+
+def test_fit_transform_skips_index_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynndescent import PyNNDescentTransformer
+
+    from scanpy.neighbors._common import _fit_transform
+
+    x = np.random.default_rng(0).normal(size=(3000, 10)).astype(np.float32)
+    kw = dict(n_neighbors=10, random_state=0, n_jobs=1)
+    expected = PyNNDescentTransformer(**kw).fit_transform(x)
+
+    calls: list[bool] = []
+    orig = PyNNDescentTransformer.fit
+
+    def fit(self, x, compress_index=True):  # noqa: FBT002
+        calls.append(compress_index)
+        return orig(self, x, compress_index=compress_index)
+
+    monkeypatch.setattr(PyNNDescentTransformer, "fit", fit)
+    actual = _fit_transform(PyNNDescentTransformer(**kw), x, discarded=True)
+    assert calls == [False]  # recognised as pynndescent's transformer
+    assert (actual != expected).nnz == 0
+    np.testing.assert_array_equal(actual.indices, expected.indices)
