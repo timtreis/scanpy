@@ -347,6 +347,17 @@ def test_scale():
     assert_allclose(v.X.mean(axis=0), np.zeros(v.shape[1]), atol=0.00001)
 
 
+def test_scale_csc_leaves_input() -> None:
+    """`scale` writes CSC results to new data, as before: the input and what shares its buffers keep their values."""
+    x = sparse.random(50, 20, density=0.3, format="csc", dtype=np.float64, rng=0)
+    sibling = sparse.csc_matrix((x.data, x.indices, x.indptr), shape=x.shape)  # noqa: TID251
+    before = x.toarray()
+    res = sc.pp.scale(x, zero_center=False)
+    np.testing.assert_array_equal(x.toarray(), before)
+    np.testing.assert_array_equal(sibling.toarray(), before)
+    assert_allclose(res.toarray(), before / np.std(before, axis=0, ddof=1), rtol=1e-12)
+
+
 def test_scale_rep(*, count_matrix_format: _MatrixFormat, zero_center: bool) -> None:
     """Test that it doesn't matter where the array being scaled is in the anndata object."""
     x = count_matrix_format(sparse.random(100, 200, density=0.3).toarray())

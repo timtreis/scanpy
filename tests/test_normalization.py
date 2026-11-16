@@ -113,6 +113,48 @@ def test_normalize_total_rep(array_type, dtype):
     check_rep_results(sc.pp.normalize_total, x)
 
 
+def test_normalize_total_sparse_in_place() -> None:
+    """Sparse X is normalized into its own `data` buffer, as dense X and `log1p` are."""
+    rng = np.random.default_rng(0)
+    x = sparse.random(50, 20, density=0.3, format="csr", dtype=np.float32, rng=rng)
+    adata = AnnData(x)
+    data = adata.X.data
+    # with `out=True`, a copy is normalized: the same arithmetic, written to a new buffer
+    expected = sc.pp.normalize_total(adata, out=True).normalized
+    assert not np.shares_memory(expected.data, data)
+    sc.pp.normalize_total(adata)
+    assert np.shares_memory(adata.X.data, data)
+    np.testing.assert_array_equal(adata.X.toarray(), expected.toarray())
+
+
+@needs.anndata_acc
+@pytest.mark.parametrize(
+    "container", [np.asarray, sparse.csr_matrix, sparse.csr_array, sparse.csc_matrix]
+)
+@pytest.mark.parametrize("dest", ["layer", "returned"])
+def test_normalize_total_elsewhere_leaves_x(container, dest: str) -> None:
+    """Writing the result to another layer, or returning it, never changes `X` or what shares it."""
+    from anndata.acc import A
+
+    rng = np.random.default_rng(0)
+    dense = (rng.integers(1, 10, (50, 20)) * (rng.random((50, 20)) < 0.3)).astype(
+        np.float32
+    )
+    dense[:, 0] = 1  # no empty cells
+    adata = AnnData(container(dense))
+    adata.layers["counts"] = adata.X  # the same object, not a copy
+    if dest == "layer":
+        sc.pp.normalize_total(adata, out=A.layers["norm"])
+        res = adata.layers["norm"]
+    else:
+        res = sc.pp.normalize_total(adata, out=True).normalized
+    np.testing.assert_array_equal(to_ndarray(adata.X), dense)
+    np.testing.assert_array_equal(to_ndarray(adata.layers["counts"]), dense)
+    np.testing.assert_allclose(
+        to_ndarray(stats.sum(res, axis=1)), np.median(dense.sum(axis=1)), rtol=1e-5
+    )
+
+
 @pytest.mark.parametrize("array_type", ARRAY_TYPES)
 @pytest.mark.parametrize("dtype", ["float32", "int64"])
 def test_normalize_total_view(array_type, dtype):
