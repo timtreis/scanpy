@@ -73,7 +73,7 @@ dependencies = [
     "statsmodels>=0.14.5",
     "threadpoolctl",
     "tqdm",
-    "umap-learn>=0.5.12",
+    "umap-learn>=0.6",
     "zarr>=3.2",
 ]
 urls.Bluesky = "https://bsky.app/profile/scverse.bsky.social"

@@ -498,3 +498,35 @@ def test_indices_distances_rect_matrix_padded() -> None:
 
     np.testing.assert_array_equal(indices, [[2, 0], [2, 3], [3, 0]])
     np.testing.assert_array_equal(distances, [[1, 2], [1, 2], [1, 4]])
+
+
+@pytest.mark.parametrize(
+    ("local_connectivity", "set_op_mix_ratio"), [(1.0, 1.0), (1.5, 0.5)]
+)
+def test_umap_connectivities_match_umap_learn(
+    local_connectivity: float, set_op_mix_ratio: float
+) -> None:
+    from umap.umap_ import fuzzy_simplicial_set
+
+    from scanpy.neighbors._connectivity import umap
+
+    rng = np.random.default_rng(0)
+    n, k = 300, 10
+    x = rng.normal(size=(n, 5))
+    d = np.linalg.norm(x[:, None] - x[None], axis=-1)
+    idx = np.argsort(d, axis=1)[:, :k]
+    dist = np.take_along_axis(d, idx, axis=1).astype(np.float32)
+    idx[:5, -2:], dist[:5, -2:] = -1, np.inf  # missing neighbours
+    kw = dict(local_connectivity=local_connectivity, set_op_mix_ratio=set_op_mix_ratio)
+    expected = fuzzy_simplicial_set(
+        sparse.coo_matrix((n, 1)),
+        k,
+        None,
+        None,
+        knn_indices=idx,
+        knn_dists=dist,
+        compatibility_layout=False,
+        **kw,
+    )[0].tocsr()
+    actual = umap(idx, dist, n_obs=n, n_neighbors=k, **kw)
+    assert (actual != expected).nnz == 0

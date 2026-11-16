@@ -1,0 +1,1 @@
+Require umap-learn ≥0.6 and remove the code paths for older versions. `compatibility_layout=False` in {func}`~scanpy.tl.umap` and {func}`~scanpy.tl.ingest` no longer needs a version check {smaller}`T Treis`
