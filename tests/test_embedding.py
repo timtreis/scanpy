@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -122,6 +123,291 @@ def test_umap_init_pos_unknown(preset: sc.Preset) -> None:
     sc.settings.preset = preset
     with pytest.raises(ValueError, match=r"Unknown `init_pos` 'spectal'"):
         sc.tl.umap(pbmc, init_pos="spectal")
+
+
+def _knn_preservation(emb: np.ndarray, conns, k: int = 10) -> float:
+    from sklearn.neighbors import NearestNeighbors
+
+    _, nn = NearestNeighbors(n_neighbors=k + 1).fit(emb).kneighbors(emb)
+    hits = [
+        len(set(nn[i, 1:]) & set(conns[i].indices[np.argsort(-conns[i].data)[:k]])) / k
+        for i in range(emb.shape[0])
+    ]
+    return float(np.mean(hits))
+
+
+@pytest.mark.parametrize("rng", [0, None], ids=["deterministic", "hogwild"])
+def test_umap_numba(rng: int | None) -> None:
+    from scanpy._utils._numba import _numba_thread_limit
+
+    pbmc = pbmc68k_reduced()
+    sc.pp.neighbors(pbmc, random_state=0)
+    ref = sc.tl.umap(pbmc, rng=0, out=True)
+    emb = sc.tl.umap(pbmc, method="numba", rng=rng, out=True)
+    assert emb.shape == (pbmc.n_obs, 2)
+    assert np.isfinite(emb).all()
+    conns = pbmc.obsp["connectivities"]
+    # local structure as well preserved as by umap-learn (≈ 0.5 here)
+    assert _knn_preservation(emb, conns) > 0.9 * _knn_preservation(ref, conns)
+    if rng is not None:
+        with _numba_thread_limit(1):
+            serial = sc.tl.umap(pbmc, method="numba", rng=rng, out=True)
+        assert_array_equal(emb, serial)
+
+
+def test_umap_numba_array_init() -> None:
+    pbmc = pbmc68k_reduced()[:200].copy()
+    init = pbmc.obsm["X_pca"][:, :2].copy()
+    emb = sc.tl.umap(pbmc, method="numba", init_pos=init, rng=0, out=True)
+    assert emb.shape == (pbmc.n_obs, 2)
+
+
+def test_umap_numba_unsupported_init() -> None:
+    pbmc = pbmc68k_reduced()[:100].copy()
+    with pytest.raises(ValueError, match=r"does not support init_pos"):
+        sc.tl.umap(pbmc, method="numba", init_pos="recursive", rng=0)
+
+
+@pytest.mark.parametrize(
+    ("rng", "expected"),
+    [pytest.param(0, True, id="seed"), pytest.param(None, False, id="rng_none")],
+)
+def test_umap_numba_mode(
+    monkeypatch: pytest.MonkeyPatch, *, rng: int | None, expected: bool
+) -> None:
+    """A seed selects the edge-coloured (deterministic) layout, `rng=None` Hogwild."""
+    from scanpy.tools import _umap_layout
+
+    seen: list[bool] = []
+    orig = _umap_layout.optimize_layout
+
+    def spy(*args, deterministic: bool, **kwargs):
+        seen.append(deterministic)
+        return orig(*args, deterministic=deterministic, **kwargs)
+
+    monkeypatch.setattr(_umap_layout, "optimize_layout", spy)
+    pbmc = pbmc68k_reduced()[:100].copy()
+    sc.tl.umap(pbmc, method="numba", rng=rng, maxiter=5)
+    assert seen == [expected]
+
+
+def _connected_knn(x: np.ndarray, *, k: int = 10):
+    """Build a symmetric float32 kNN graph of `x` (like `pp.neighbors`’), plus a ring through all points so it’s connected."""
+    from scipy import sparse
+    from sklearn.neighbors import kneighbors_graph
+
+    n = x.shape[0]
+    g = kneighbors_graph(x, k, mode="distance")
+    g.data = np.exp(-g.data / g.data.mean())
+    i = np.arange(n)
+    ring = sparse.coo_matrix((np.full(n, 0.1), (i, (i + 1) % n)), shape=(n, n))
+    g = g + ring
+    return ((g + g.T) / 2).astype(np.float32).tocsr()
+
+
+# blob sizes and number of connected components
+_SPECTRAL_CASES = {
+    "connected": ([300], 1),
+    "two_components": ([200, 150], 2),
+    # plus a 3-vertex path and an isolated vertex, which get random positions
+    "many_components": ([200, 150, 120], 5),
+}
+
+
+def _spectral_inputs(case: str):
+    """Return data and its graph, with components as in `_SPECTRAL_CASES`."""
+    from scipy import sparse
+
+    rng = np.random.default_rng(0)
+    sizes, _ = _SPECTRAL_CASES[case]
+    blobs = [rng.normal(size=(n, 5)) + 100 * c for c, n in enumerate(sizes)]
+    graphs = [_connected_knn(b) for b in blobs]
+    if case == "many_components":
+        path = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], np.float32)
+        single = sparse.coo_matrix((1, 1), dtype=np.float32)
+        graphs += [sparse.coo_matrix(path), single]
+        blobs += [rng.normal(size=(3, 5)) - 100, rng.normal(size=(1, 5)) - 200]
+    return np.vstack(blobs), sparse.block_diag(graphs, format="csr")
+
+
+# umap-learn warns about disconnected graphs; both implementations handle them the same way
+@pytest.mark.filterwarnings("ignore:Graph is not fully connected:UserWarning")
+@pytest.mark.parametrize("case", _SPECTRAL_CASES)
+def test_spectral_layout_matches_umap(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    import umap.spectral
+    from scipy.sparse.csgraph import connected_components
+    from umap.spectral import spectral_layout as umap_spectral_layout
+
+    from scanpy.tools._spectral import spectral_layout
+
+    # umap-learn's centroid layout differs between runs with the same seed; both use it as is
+    monkeypatch.setattr(
+        umap.spectral,
+        "component_layout",
+        lambda data, n, labels, dim, *_, **__: np.arange(n * dim, dtype=float).reshape(
+            n, dim
+        ),
+    )
+    x, g = _spectral_inputs(case)
+    assert connected_components(g)[0] == _SPECTRAL_CASES[case][1]
+    expected = umap_spectral_layout(
+        x, g, 2, np.random.RandomState(0), compatibility_layout=False
+    )
+    actual = spectral_layout(x, g, 2, np.random.RandomState(0))
+    assert_array_equal(actual, expected)
+    assert actual.dtype == expected.dtype
+
+
+def test_spectral_layout_lobpcg_matches_umap() -> None:
+    """LOBPCG, which umap-learn uses from 2M vertices on."""
+    from umap.spectral import _spectral_layout as umap_spectral_layout
+
+    from scanpy.tools._spectral import spectral_layout
+
+    x, g = _spectral_inputs("connected")
+    expected = umap_spectral_layout(
+        x, g, 2, np.random.RandomState(0), method="lobpcg", compatibility_layout=False
+    )
+    actual = spectral_layout(x, g, 2, np.random.RandomState(0), method="lobpcg")
+    assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("index_dtype", [np.int32, np.int64])
+@pytest.mark.parametrize("shape", [(500,), (500, 3)], ids=["vector", "block"])
+def test_csr_operator_matches_scipy(
+    dtype: type, index_dtype: type, shape: tuple[int, ...]
+) -> None:
+    """Parallel products give scipy’s bits, also for unsorted and duplicate indices and negative values."""
+    import platform
+
+    from scipy import sparse
+
+    from scanpy.tools._spectral import _CsrOperator, _rounds_like_scipy
+
+    if platform.machine().lower() in {"x86_64", "amd64"}:
+        # scipy’s x86-64 builds don’t fuse multiply-adds, so the parallel path must be used
+        assert _rounds_like_scipy(np.dtype(dtype))
+    rng = np.random.default_rng(0)
+    n, per_row = 500, 20
+    m = sparse.csr_matrix(  # noqa: TID251 (building a test input)
+        (
+            rng.standard_normal(n * per_row).astype(dtype),
+            rng.integers(0, n, n * per_row),
+            np.arange(0, n * per_row + 1, per_row),
+        ),
+        shape=(n, n),
+    )
+    # the constructor picks the smallest index dtype
+    m.indices, m.indptr = m.indices.astype(index_dtype), m.indptr.astype(index_dtype)
+    x = rng.standard_normal(shape).astype(dtype)
+    op = _CsrOperator(m)
+    actual = op @ x
+    assert_array_equal(actual, m @ x)
+    assert actual.dtype == dtype
+    assert op.n_products == 1
+
+
+@pytest.mark.parametrize(
+    "init_pos",
+    [
+        pytest.param("spectral", id="spectral"),
+        pytest.param(np.zeros((100, 2), np.float32), id="array"),
+    ],
+)
+def test_umap_numba_n_components(
+    monkeypatch: pytest.MonkeyPatch, init_pos: str | np.ndarray
+) -> None:
+    from scanpy.tools import _umap
+
+    def no_init(*_, **__):
+        pytest.fail("init computed before validating n_components")
+
+    monkeypatch.setattr(_umap, "_init_coords", no_init)
+    pbmc = pbmc68k_reduced()[:100].copy()
+    with pytest.raises(ValueError, match=r"n_components=2 only"):
+        sc.tl.umap(pbmc, method="numba", n_components=3, init_pos=init_pos, rng=0)
+
+
+def test_umap_numba_init_columns() -> None:
+    pbmc = pbmc68k_reduced()[:100].copy()
+    init = pbmc.obsm["X_pca"][:, :3].copy()
+    with pytest.raises(ValueError, match=r"`init_pos` has 3 columns"):
+        sc.tl.umap(pbmc, method="numba", init_pos=init, rng=0)
+
+
+def test_umap_numba_compatibility_layout_warns() -> None:
+    pbmc = pbmc68k_reduced()[:100].copy()
+    with pytest.warns(UserWarning, match=r"`compatibility_layout` has no effect"):
+        sc.tl.umap(pbmc, method="numba", compatibility_layout=True, rng=0, maxiter=5)
+
+
+def test_umap_numba_constant_init() -> None:
+    pbmc = pbmc68k_reduced()[:100].copy()
+    init = np.ones((pbmc.n_obs, 2), np.float32)
+    init[:, 1] = np.arange(pbmc.n_obs)  # one constant column, one not
+    emb = sc.tl.umap(pbmc, method="numba", init_pos=init, rng=0, maxiter=5, out=True)
+    assert np.isfinite(emb).all()
+    emb = sc.tl.umap(
+        pbmc, method="numba", init_pos=np.ones_like(init), rng=0, maxiter=5, out=True
+    )
+    assert np.isfinite(emb).all()
+
+
+@pytest.mark.parametrize("deterministic", [True, False])
+def test_umap_layout_all_explicit_zeros(*, deterministic: bool) -> None:
+    from scipy import sparse
+
+    from scanpy.tools._umap_layout import optimize_layout
+
+    # 0 – 1 – 2 path, all values stored as explicit zeros
+    g = sparse.csr_matrix(  # noqa: TID251 (building a test input)
+        (np.zeros(4, np.float32), [1, 0, 2, 1], [0, 1, 3, 4]), shape=(3, 3)
+    )
+    init = np.random.default_rng(0).random((3, 2)).astype(np.float32)
+    pos = optimize_layout(
+        init, g, n_epochs=10, a=1.0, b=1.0, deterministic=deterministic
+    )
+    assert_array_equal(pos, init)
+
+
+def test_edge_coloring_matches_greedy() -> None:
+    """Per-vertex bitsets give the colours of a plain greedy colouring, on a graph with hubs."""
+    from itertools import count
+
+    from scanpy.tools._umap_layout import _edge_coloring
+
+    rng = np.random.default_rng(0)
+    n = 400
+    hubs = {(h, v) for h in range(3) for v in range(h + 1, n) if rng.random() < 0.8}
+    rand = {
+        (int(min(u, v)), int(max(u, v)))
+        for u, v in rng.integers(0, n, (800, 2))
+        if u != v
+    }
+    us, vs = np.array(sorted(hubs | rand), dtype=np.int64).T
+    deg = np.bincount(us, minlength=n) + np.bincount(vs, minlength=n)
+    first = np.argsort(-np.maximum(deg[us], deg[vs]), kind="stable")
+    heads, tails = us[first], vs[first]
+
+    order, offsets = _edge_coloring(heads, tails, deg)
+    colors = np.empty(len(heads), dtype=np.int64)
+    colors[order] = np.repeat(np.arange(len(offsets) - 1), np.diff(offsets))
+
+    used: list[set[int]] = [set() for _ in range(n)]
+    expected = []
+    for u, v in zip(heads.tolist(), tails.tolist(), strict=True):
+        c = next(c for c in count() if c not in used[u] and c not in used[v])
+        used[u].add(c)
+        used[v].add(c)
+        expected.append(c)
+    assert_array_equal(colors, expected)
+    assert max(expected) >= 2 * 64  # the colours span several bitset words
+    # within a colour, edges keep their input order
+    for lo, hi in itertools.pairwise(offsets):
+        assert (np.diff(order[lo:hi]) > 0).all()
 
 
 @pytest.mark.parametrize("rng_arg", ["rng", "random_state"])

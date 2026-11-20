@@ -16,7 +16,7 @@ from pandas.testing import assert_frame_equal, assert_index_equal
 
 import scanpy as sc
 from scanpy._compat import CSRBase
-from testing.scanpy._helpers import _check_check_values_warnings
+from testing.scanpy._helpers import _check_check_values_warnings, with_duplicates
 from testing.scanpy._helpers.data import pbmc3k, pbmc68k_reduced
 from testing.scanpy._pytest.marks import needs
 from testing.scanpy._pytest.params import ARRAY_TYPES, as_dense_jax_array
@@ -893,3 +893,162 @@ def test_hvg_batch(flavor: str) -> None:
     for batch in [A.obs["batch"], "obs.batch"]:
         res = sc.pp.highly_variable_genes(adata, batch=batch, **kw)
         pd.testing.assert_frame_equal(res, expected)
+
+
+@pytest.mark.parametrize(
+    ("flavor", "base"), [("seurat", None), ("seurat", 2), ("cell_ranger", None)]
+)
+def test_batched_csr_matches_dense(
+    monkeypatch: pytest.MonkeyPatch, flavor: Literal["seurat", "cell_ranger"], base
+) -> None:
+    """The fused CSR path matches the per-batch path taken for dense input."""
+    from scanpy.preprocessing import _highly_variable_genes as hvg_mod
+
+    # chunks spanning several batches and batches spanning several chunks
+    monkeypatch.setattr(hvg_mod, "N_REDUCE_CHUNKS", 7)
+    adata = pbmc3k()
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata, base=base)
+    rng = np.random.default_rng(0)
+    adata.obs["batch"] = pd.Categorical(
+        rng.choice(list("abcd"), adata.n_obs, p=[0.5, 0.3, 0.19, 0.01])
+    )
+    dense = adata.copy()
+    dense.X = dense.X.toarray()
+    kw = dict(batch_key="batch", flavor=flavor, n_top_genes=500, out=True)
+    res_det = sc.pp.highly_variable_genes(adata, **kw)  # the per-batch path
+    with sc.settings.override(reference_numerics=False):
+        res_csr = sc.pp.highly_variable_genes(adata, **kw)
+    res_dense = sc.pp.highly_variable_genes(dense, **kw)
+    assert_frame_equal(res_csr, res_dense, check_exact=False, rtol=1e-5, atol=1e-5)
+    assert_frame_equal(res_csr, res_det, check_exact=False, rtol=1e-5, atol=1e-5)
+
+
+def _batched_hvg_csr_adata(n_obs: int = 400, n_vars: int = 200) -> AnnData:
+    rng = np.random.default_rng(0)
+    x = sps.random(n_obs, n_vars, density=0.2, format="csr", dtype=np.float32, rng=rng)
+    x.data = np.log1p(x.data * 10).astype(np.float32)
+    batch = np.where(np.arange(n_obs) < n_obs // 2, "a", "b").astype(object)
+    return AnnData(
+        x, obs=pd.DataFrame({"batch": batch}, index=[f"c{i}" for i in range(n_obs)])
+    )
+
+
+def test_batched_csr_duplicate_entries() -> None:
+    a = _batched_hvg_csr_adata()
+    x = a.X
+    b = AnnData(with_duplicates(x), obs=a.obs.copy(), var=a.var.copy())
+    assert not b.X.has_canonical_format
+    with sc.settings.override(reference_numerics=False):
+        ra = sc.pp.highly_variable_genes(a, batch_key="batch", n_top_genes=50, out=True)
+        rb = sc.pp.highly_variable_genes(b, batch_key="batch", n_top_genes=50, out=True)
+    pd.testing.assert_frame_equal(ra, rb, rtol=1e-5, atol=1e-5)
+    assert not b.X.has_canonical_format  # the input isn't modified
+
+
+def test_batched_csr_single_cell_batch() -> None:
+    adata = _batched_hvg_csr_adata()
+    adata.obs.loc["c0", "batch"] = "single"
+    # the single cell has no variance to normalise: that batch warns instead of crashing
+    with (
+        sc.settings.override(reference_numerics=False),
+        pytest.warns(UserWarning, match=r"number of normalized dispersions \(=0\)"),
+    ):
+        res = sc.pp.highly_variable_genes(
+            adata, batch_key="batch", n_top_genes=50, out=True
+        )
+    assert res["highly_variable"].sum() == 50
+
+
+def _per_batch_moments(x, mask: np.ndarray, *, expm1: bool, base: float | None):
+    """Upstream's `_highly_variable_genes_single_batch` moments for one batch, step by step."""
+    xb = x[mask].copy()  # `adata[batch_mask].copy()`
+    filt = (
+        stats.sum(xb > 0, axis=0) >= 1
+    )  # `filter_genes(x, min_cells=1)`, summing duplicates
+    if not filt.all():
+        xb = xb[:, filt].copy()
+    if expm1:
+        xb = xb.copy()
+        if base is not None:
+            xb *= np.log(base)
+        xb = np.expm1(xb)
+    mean, var = stats.mean_var(xb, axis=0, correction=1)
+    return mean, var, filt
+
+
+@pytest.mark.parametrize(
+    ("flavor", "base"), [("seurat", None), ("seurat", 2), ("cell_ranger", None)]
+)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("container", [sps.csr_matrix, sps.csr_array])  # noqa: TID251
+@pytest.mark.parametrize("duplicates", [False, True], ids=["canonical", "dups"])
+@pytest.mark.parametrize("n_threads", [1, 3, None], ids=["1", "3", "all"])
+def test_batched_csr_reference_moments_match_per_batch(
+    *,
+    flavor: str,
+    base: float | None,
+    dtype: type,
+    container: type,
+    duplicates: bool,
+    n_threads: int | None,
+) -> None:
+    """With `settings.reference_numerics`, each batch's moments are bit-identical to upstream's per-batch path.
+
+    That path depends on the thread count (fast-array-utils keeps a partial per thread), and so
+    does this one, in the same way.
+    """
+    from scanpy._utils._numba import _numba_thread_limit
+    from scanpy.get._kernels import _group_layout
+    from scanpy.preprocessing._highly_variable_genes import _batch_moments_reference
+
+    rng = np.random.default_rng(0)
+    coo = sps.random(600, 300, density=0.15, format="coo", dtype=np.float64, rng=rng)
+    keep = (coo.col >= 10) & (coo.row % 37 != 0)  # empty genes and empty cells
+    x = container(
+        (np.log1p(coo.data[keep] * 50).astype(dtype), (coo.row[keep], coo.col[keep])),
+        shape=coo.shape,
+    )
+    x.data[::13] = 0  # explicit zeros
+    if duplicates:
+        x = with_duplicates(x)
+    # interleaved batches, a single-cell batch (4) and an unused category (5)
+    codes = rng.choice(4, size=x.shape[0], p=[0.5, 0.3, 0.15, 0.05])
+    codes[7] = 4
+    rows, group_ptr, counts = _group_layout(codes, 6)
+    expm1 = flavor == "seurat"
+
+    canonical = x.copy()  # as `_hvg_batched_csr`
+    canonical.sum_duplicates()
+    with _numba_thread_limit(n_threads):
+        got = list(
+            _batch_moments_reference(
+                canonical,
+                codes,
+                rows,
+                group_ptr,
+                expm1=expm1,
+                log_base=None if base is None else np.log(base),
+            )
+        )
+        for b, (mean, var, filt) in enumerate(got):
+            if counts[b] == 0:
+                assert not filt.any()
+                continue
+            ref_mean, ref_var, ref_filt = _per_batch_moments(
+                x, codes == b, expm1=expm1, base=base
+            )
+            np.testing.assert_array_equal(filt, ref_filt)
+            for actual, expected in ((mean[filt], ref_mean), (var[filt], ref_var)):
+                assert actual.dtype == expected.dtype
+                np.testing.assert_array_equal(actual, expected)
+
+
+def test_batched_csr_reference_duplicates() -> None:
+    """Duplicate entries give the table of their sums, and the input isn't modified."""
+    a = _batched_hvg_csr_adata()
+    b = AnnData(with_duplicates(a.X), obs=a.obs.copy(), var=a.var.copy())
+    ra = sc.pp.highly_variable_genes(a, batch_key="batch", n_top_genes=50, out=True)
+    rb = sc.pp.highly_variable_genes(b, batch_key="batch", n_top_genes=50, out=True)
+    pd.testing.assert_frame_equal(ra, rb, check_exact=True)
+    assert not b.X.has_canonical_format

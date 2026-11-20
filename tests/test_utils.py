@@ -29,6 +29,7 @@ from scanpy._utils.random import (
     random_k_tuples,
     random_str,
 )
+from testing.scanpy._helpers import with_duplicates
 from testing.scanpy._pytest.marks import needs
 from testing.scanpy._pytest.params import (
     ARRAY_TYPES,
@@ -168,6 +169,22 @@ def test_scale_rechunk(array_type, axis, op):
         pytest.param(lambda rng: rng.normal(size=(100, 100)), False, id="normal"),
         pytest.param(
             lambda _: np.array([[0, 0, 0], [0, -1, 0], [0, 0, 0]]), False, id="middle"
+        ),
+        pytest.param(
+            lambda rng: rng.poisson(size=(100, 100)).astype(np.float32),
+            True,
+            id="poisson-float32",
+        ),
+        pytest.param(lambda _: np.array([[1.0, np.nan], [2.0, 3.0]]), False, id="nan"),
+        pytest.param(lambda _: np.array([[1.0, np.inf], [2.0, 3.0]]), False, id="inf"),
+        pytest.param(
+            # only the very last value is fractional: must be found in the last chunk
+            lambda rng: np.concatenate([
+                rng.poisson(size=(999, 1000)).astype(np.float64),
+                np.r_[np.ones(999), 0.5][None],
+            ]),
+            False,
+            id="last-value",
         ),
     ],
 )
@@ -355,3 +372,205 @@ def test_numba_thread_limit_none_is_noop() -> None:
     with _numba_thread_limit(None) as resolved:
         assert resolved is None
         assert numba.get_num_threads() == outer
+
+
+@needs.igraph
+def test_get_igraph_from_adjacency_matches_fancy_indexing() -> None:
+    from scipy import sparse
+
+    from scanpy._utils import get_igraph_from_adjacency
+
+    adj = sparse.random(300, 300, density=0.05, format="csr", random_state=0)
+    adj = adj + adj.T
+    adj.data[::7] = 0  # explicit zeros must not become edges
+    g = get_igraph_from_adjacency(
+        adj, directed=True
+    )  # undirected graphs reorder edge endpoints
+    src, dst = adj.nonzero()
+    assert g.get_edgelist() == list(zip(src.tolist(), dst.tolist(), strict=True))
+    np.testing.assert_array_equal(g.es["weight"], np.asarray(adj[src, dst]).ravel())
+
+
+def test_select_groups_masks_match_value_comparison() -> None:
+    import pandas as pd
+    from anndata import AnnData
+
+    from scanpy._utils import select_groups
+
+    # "0" is an unused category name *and* matches the index-fallback of unused category 2
+    cats = ["a", "b", "unused", "0"]
+    values = pd.Categorical(["a", "b", "a", "0", "b"], categories=cats)
+    adata = AnnData(obs=pd.DataFrame({"g": values}, index=[f"c{i}" for i in range(5)]))
+    names, masks = select_groups(adata, key="g")
+    arr = np.asarray(values.astype(str))
+    expected = np.stack([
+        (name == arr) if name in values else (str(i) == arr)
+        for i, name in enumerate(cats)
+    ])
+    np.testing.assert_array_equal(masks, expected)
+    assert list(names) == cats
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("op", [mul, truediv])
+@pytest.mark.parametrize("writeable", [True, False], ids=["writeable", "readonly"])
+def test_axis_mul_or_truediv_out_in_place(fmt: str, op, *, writeable: bool) -> None:
+    """With `out`, `x.data` is written in place (as `log1p` does), unless it is read-only."""
+    from scipy import sparse
+
+    x = sparse.random(50, 20, density=0.3, format=fmt, dtype=np.float64, rng=0)
+    x.data.flags.writeable = writeable
+    sibling = type(x)(
+        (x.data, x.indices, x.indptr), shape=x.shape
+    )  # shares x's buffers
+    before = sibling.toarray()
+    scale = np.linspace(1, 2, 20)
+    res = axis_mul_or_truediv(x, scale, op=op, axis=1, out=x)
+    assert np.shares_memory(res.data, sibling.data) is writeable
+    # the same elementwise arithmetic as numpy's
+    np.testing.assert_array_equal(res.toarray(), op(before, scale))
+    np.testing.assert_array_equal(
+        sibling.toarray(), res.toarray() if writeable else before
+    )
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("op", [mul, truediv])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_axis_mul_or_truediv_no_out_leaves_input(fmt: str, op, axis: int) -> None:
+    """Without `out`, the result is a new matrix and the input keeps its values."""
+    from scipy import sparse
+
+    x = sparse.random(50, 20, density=0.3, format=fmt, dtype=np.float64, rng=0)
+    before = x.toarray()
+    scale = np.linspace(1, 2, x.shape[axis])
+    res = axis_mul_or_truediv(x, scale, op=op, axis=axis)
+    assert not np.shares_memory(res.data, x.data)
+    np.testing.assert_array_equal(x.toarray(), before)
+    np.testing.assert_array_equal(
+        res.toarray(), op(before, scale[:, None] if axis == 0 else scale)
+    )
+
+
+@pytest.mark.filterwarnings("ignore:divide by zero encountered:RuntimeWarning")
+def test_divide_by_zero_off_main_thread() -> None:
+    """fast-array-utils runs kernels serially off the main thread; division by zero must still give inf."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from scipy import sparse
+
+    x = sparse.csr_matrix(np.array([[0, 1.0, 2.0], [3.0, 0, 4.0]]))  # noqa: TID251
+    divisor = np.array([0.1, 0.2, 0.0])
+    with ThreadPoolExecutor(1) as pool:
+        res = pool.submit(
+            axis_mul_or_truediv,
+            x,
+            divisor,
+            op=truediv,
+            axis=1,
+            allow_divide_by_zero=True,
+        ).result()
+    np.testing.assert_array_equal(
+        res.toarray(), np.array([[0, 5.0, np.inf], [30.0, 0, np.inf]])
+    )
+
+
+def test_has_canonical_format_matches_scipy() -> None:
+    from scipy import sparse
+
+    from scanpy._utils._numba import has_canonical_format
+
+    x = sparse.random(300, 50, density=0.2, format="csr", rng=0)
+    unsorted = x.copy()
+    row = np.flatnonzero(np.diff(x.indptr) >= 2)[0]
+    lo, hi = x.indptr[row], x.indptr[row + 1]
+    unsorted.indices[lo:hi] = unsorted.indices[lo:hi][::-1]
+    dup = with_duplicates(x, split=False)
+    for m in (x, unsorted, dup, x.tocsc()):
+        expected = type(m)(
+            (m.data, m.indices, m.indptr), shape=m.shape
+        ).has_canonical_format
+        m2 = type(m)((m.data, m.indices, m.indptr), shape=m.shape)
+        assert has_canonical_format(m2) is expected
+        assert m2.has_canonical_format is expected  # cached for scipy
+
+
+def test_has_canonical_format_respects_unsorted_flag() -> None:
+    """A cached ``has_sorted_indices = False`` means not canonical, as in scipy."""
+    from scipy import sparse
+
+    from scanpy._utils._numba import has_canonical_format
+
+    x = sparse.random(30, 20, density=0.2, format="csr", rng=0)
+    x.has_canonical_format = True  # cached as canonical (and sorted)
+    x.has_sorted_indices = False
+    assert x.has_canonical_format is False  # scipy's semantics
+    x.has_canonical_format = True
+    x.has_sorted_indices = False
+    assert has_canonical_format(x) is False
+    assert x.has_canonical_format is False
+
+
+@pytest.mark.parametrize("dtype", [np.longdouble, np.complex64, np.float32, np.int64])
+def test_eliminate_zeros_dtypes(dtype: type) -> None:
+    """Dtypes without numba kernels (long double, complex) fall back to scipy."""
+    from scipy import sparse
+
+    from scanpy._utils._numba import eliminate_zeros
+
+    x = sparse.csr_matrix(np.array([[0, 1, 2], [3, 0, 4]], dtype=dtype))  # noqa: TID251
+    x.data[1] = 0
+    expected = x.copy()
+    expected.eliminate_zeros()
+    eliminate_zeros(x)
+    np.testing.assert_array_equal(x.data, expected.data)
+    np.testing.assert_array_equal(x.indices, expected.indices)
+    np.testing.assert_array_equal(x.indptr, expected.indptr)
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("n_threads", [1, 3, None], ids=["1", "3", "all"])
+@pytest.mark.parametrize(
+    "zeros",
+    [
+        pytest.param([5], id="one"),
+        pytest.param([0, 1, 2, -1], id="ends"),
+        pytest.param(slice(40, 120), id="whole-rows"),
+        pytest.param(slice(None, None, 37), id="spread"),
+        pytest.param(slice(None), id="all"),
+    ],
+)
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "scipy"])
+def test_eliminate_zeros_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    fmt: str,
+    n_threads: int | None,
+    zeros: list[int] | slice,
+    *,
+    parallel: bool,
+) -> None:
+    """Few explicit zeros are dropped in parallel, with exactly scipy's result; more go to scipy."""
+    from scipy import sparse
+
+    from scanpy._utils import _numba
+
+    x = sparse.random(300, 40, density=0.1, format=fmt, dtype=np.float32, rng=0)
+    x.data[zeros] = 0
+    expected = x.copy()
+    expected.eliminate_zeros()
+    if not parallel:
+        monkeypatch.setattr(_numba, "_RARE_ZEROS", 0)
+    used_scipy = []
+    scipy_eliminate = type(x).eliminate_zeros
+    monkeypatch.setattr(
+        type(x),
+        "eliminate_zeros",
+        lambda self: used_scipy.append(True) or scipy_eliminate(self),
+    )
+    with _numba._numba_thread_limit(n_threads):
+        _numba.eliminate_zeros(x)
+    assert used_scipy == ([] if parallel else [True])
+    assert x.indptr.dtype == expected.indptr.dtype
+    np.testing.assert_array_equal(x.indptr, expected.indptr)
+    np.testing.assert_array_equal(x.indices, expected.indices)
+    np.testing.assert_array_equal(x.data, expected.data)

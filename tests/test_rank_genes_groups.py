@@ -644,3 +644,121 @@ def test_rank_genes_groups_groupby_ref() -> None:
     res = rank_genes_groups(pbmc, A.obs["bulk_labels"], n_genes=3, out=True)
     np.testing.assert_array_equal(res["names"], expected["names"])
     assert res["params"]["groupby"] == "bulk_labels"
+
+
+def _upstream_group_stats(
+    x, codes: np.ndarray, n_groups: int, *, need_var: bool
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Upstream's `_RankGenes._aggregate_group_stats` on CSR, with `aggregate`'s serial kernels.
+
+    `aggregate` drops empty groups, and computes the mean as sum / count without the variance
+    (`agg_sum_csr`) and with Welford's algorithm with it (`mean_var_csr`, then `dof=1`).
+    """
+    from scipy import sparse
+
+    from scanpy._utils._numba import arrays
+    from scanpy.get._kernels import agg_sum_csr, mean_var_csr
+
+    present = np.unique(codes)
+    n = len(codes)
+    indicator = sparse.csr_matrix(  # noqa: TID251
+        (np.ones(n), (np.searchsorted(present, codes), np.arange(n))),
+        shape=(len(present), n),
+    )
+    counts = np.diff(indicator.indptr)
+    n_genes = x.shape[1]
+    nnz = np.zeros((len(present), n_genes), dtype=np.int64)
+    agg_sum_csr(arrays(indicator), arrays((x != 0).astype(np.uint8)), nnz)
+    if need_var:
+        mean_p, var_p = mean_var_csr(arrays(indicator), arrays(x))
+        denom = np.where(counts > 1, counts - 1, np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            var_p *= (counts / denom)[:, None]
+    else:
+        dtype = np.int64 if np.issubdtype(x.dtype, np.integer) else np.float64
+        sums = np.zeros((len(present), n_genes), dtype=dtype)
+        agg_sum_csr(arrays(indicator), arrays(x), sums)
+        mean_p, var_p = sums / counts[:, None], None
+    mean = np.zeros((n_groups, n_genes))
+    mean[present] = mean_p
+    var = None
+    if need_var:
+        var = np.zeros((n_groups, n_genes))
+        var[present] = var_p
+    nnz_all = np.zeros((n_groups, n_genes), dtype=np.int64)
+    nnz_all[present] = nnz
+    return mean, var, nnz_all
+
+
+@pytest.mark.parametrize("n_blocks", [1, 7, 64])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+@pytest.mark.parametrize("need_var", [False, True], ids=["mean", "mean_var"])
+@pytest.mark.parametrize("n_threads", [1, 3, None], ids=["1", "3", "all"])
+def test_grouped_stats_csr_matches_upstream(
+    n_blocks: int, dtype: type, n_threads: int | None, *, need_var: bool
+) -> None:
+    """Bit-identical to upstream's serial kernels, for any number of gene blocks and threads."""
+    from scipy import sparse
+
+    from scanpy._utils._numba import _numba_thread_limit
+    from scanpy.tools._rank_genes_groups import _grouped_stats_csr
+
+    rng = np.random.default_rng(0)
+    dense = rng.random((2000, 50))
+    dense[dense < 0.7] = 0
+    dense[:, 3] = 0  # an empty gene
+    x = sparse.csr_matrix((np.log1p(dense * 10) * 3).astype(dtype))  # noqa: TID251
+    # very unequal groups, an empty one (3) and a singleton (4)
+    codes = rng.choice([0, 1, 2], size=2000, p=[0.8, 0.15, 0.05]).astype(np.int64)
+    codes[7] = 4
+
+    ctx = (
+        pytest.warns(RuntimeWarning, match=r"Group counts matches dof.*\['4'\]")
+        if need_var
+        else nullcontext()
+    )
+    ref_mean, ref_var, ref_nnz = _upstream_group_stats(x, codes, 5, need_var=need_var)
+    with _numba_thread_limit(n_threads), ctx:
+        mean, var, nnz = _grouped_stats_csr(
+            x, codes, 5, need_var=need_var, n_blocks=n_blocks
+        )
+    np.testing.assert_array_equal(mean, ref_mean)
+    np.testing.assert_array_equal(nnz, ref_nnz)
+    if need_var:
+        np.testing.assert_array_equal(var, ref_var)  # NaN for the singleton
+        assert np.isnan(var[4]).all()
+        assert (var[3] == 0).all()
+    else:
+        assert var is None
+
+
+def test_grouped_stats_dof_warning_as_aggregate() -> None:
+    """The kernel path warns with exactly the text of the `aggregate` call it replaces."""
+    import warnings
+
+    from scipy import sparse
+
+    from scanpy._utils import dim_acc
+    from scanpy.tools._rank_genes_groups import _grouped_stats_csr
+
+    x = sparse.csr_matrix(np.arange(12, dtype=np.float64).reshape(6, 2))  # noqa: TID251
+    codes = np.array([0, 0, 2, 2, 4, 1])  # singletons 4 and 1, an empty group 3
+    agg_adata = AnnData(
+        X=x,
+        obs=pd.DataFrame(
+            {"_g": pd.Categorical(codes, categories=range(5))},
+            index=pd.RangeIndex(len(codes)).astype(str),
+        ),
+    )
+    with warnings.catch_warnings(record=True) as from_aggregate:
+        warnings.simplefilter("always")
+        sc.get.aggregate(agg_adata, by=dim_acc("_g", dim="obs"), func=["var"], dof=1)
+    with warnings.catch_warnings(record=True) as from_kernel:
+        warnings.simplefilter("always")
+        _grouped_stats_csr(x, codes, 5, need_var=True)
+
+    def dof_messages(record: list[warnings.WarningMessage]) -> list[str]:
+        return [str(w.message) for w in record if "dof" in str(w.message)]
+
+    assert dof_messages(from_kernel) == dof_messages(from_aggregate)
+    assert "['1', '4']" in dof_messages(from_kernel)[0]

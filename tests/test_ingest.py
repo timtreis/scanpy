@@ -11,7 +11,6 @@ from umap import UMAP
 
 import scanpy as sc
 from scanpy import settings
-from scanpy.tools._umap import _umap_layout_kw
 from testing.scanpy._helpers.data import pbmc68k_reduced
 from testing.scanpy._pytest.marks import needs
 
@@ -221,14 +220,7 @@ def test_ingest_function(
     "compatibility_layout",
     [
         pytest.param(True, id="compat"),
-        pytest.param(
-            False,
-            id="modern",
-            marks=pytest.mark.skipif(
-                not _umap_layout_kw(compatibility_layout=False),
-                reason="needs umap-learn ≥0.6",
-            ),
-        ),
+        pytest.param(False, id="modern"),
     ],
 )
 def test_ingest_map_embedding_umap(*, compatibility_layout: bool) -> None:
@@ -250,7 +242,7 @@ def test_ingest_map_embedding_umap(*, compatibility_layout: bool) -> None:
         random_state=0,
         n_neighbors=4,
         n_jobs=1,
-        **_umap_layout_kw(compatibility_layout=compatibility_layout),
+        compatibility_layout=compatibility_layout,
     )
     reducer.fit(X)
     umap_transformed_t = reducer.transform(T)

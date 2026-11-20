@@ -6,6 +6,14 @@ import numba
 import numpy as np
 from fast_array_utils.numba import njit
 
+from .._compat import warn
+from .._utils._numba import (
+    CompressedArrays,
+    _chunk_bounds,
+    arrays,
+    has_canonical_format,
+)
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -181,3 +189,211 @@ def mean_var_csc(
                 var[cat, col] += mean_a * mean_a * n_nz * k / n_obs
             var[cat, col] /= n_obs
     return mean, var
+
+
+# Column blocks of the blocked group kernels. Any count gives the same result: each (block, group)
+# task owns its cells and walks the group's rows in order, as the per-group kernels above do.
+# This many blocks times the groups gives enough tasks to balance a dominant group.
+
+
+def _n_col_blocks(n_groups: int) -> int:
+    """Gene blocks of the (gene block, group) kernels: about 16 tasks per thread, 4 to 64 blocks.
+
+    Each task binary-searches every row of its group for the block's first gene, so more blocks
+    cost more searches, and fewer leave a large group's tasks unbalanced. 16 blocks instead of a
+    fixed 64 take a third off the kernel on 300k cells, 18 groups and 15 threads. Results don't
+    depend on the block count.
+    """
+    return min(64, max(4, -(-16 * numba.get_num_threads() // max(1, n_groups))))
+
+
+@njit
+def _mean_var_group_blocks(  # noqa: PLR0917
+    indptr: NDArray[np.integer],
+    indices: NDArray[np.integer],
+    data: NDArray[np.number],
+    rows: NDArray[np.int64],
+    group_ptr: NDArray[np.int64],
+    block_ptr: NDArray[np.int64],
+    mean: NDArray[np.float64],
+    var: NDArray[np.float64],
+    nnz: NDArray[np.int64],
+) -> None:
+    """:func:`mean_var_csr`'s arithmetic, parallel over (column block, group) pairs.
+
+    Bit-identical to it, but a dominant group no longer serialises the pass. Each pair
+    writes its own cells; rows reach their block's first column by binary search,
+    so `indices` must be sorted.
+    """
+    n_groups = group_ptr.shape[0] - 1
+    for t in numba.prange((block_ptr.shape[0] - 1) * n_groups):
+        b, g = t // n_groups, t % n_groups  # block-major: each thread sees every group
+        j0, j1 = block_ptr[b], block_ptr[b + 1]
+        lo, hi = group_ptr[g], group_ptr[g + 1]
+        n_obs = hi - lo
+        if n_obs == 0:
+            continue
+        for p in range(lo, hi):
+            r = rows[p]
+            start, end = indptr[r], indptr[r + 1]
+            k = start + np.searchsorted(indices[start:end], j0)
+            while k < end:
+                col = indices[k]
+                if col >= j1:
+                    break
+                value = np.float64(data[k])
+                n = nnz[g, col] + 1
+                nnz[g, col] = n
+                m = mean[g, col]
+                delta = value - m
+                m += delta / n
+                mean[g, col] = m
+                var[g, col] += delta * (value - m)
+                k += 1
+        for col in range(j0, j1):
+            n_nz = nnz[g, col]
+            n_zeros = n_obs - n_nz
+            if n_zeros > 0 and n_nz > 0:
+                mean_a = mean[g, col]
+                mean[g, col] = mean_a * n_nz / n_obs
+                var[g, col] += mean_a * mean_a * n_nz * n_zeros / n_obs
+            var[g, col] /= n_obs
+
+
+@njit
+def _sum_group_blocks(  # noqa: PLR0917
+    indptr: NDArray[np.integer],
+    indices: NDArray[np.integer],
+    data: NDArray[np.number],
+    rows: NDArray[np.int64],
+    group_ptr: NDArray[np.int64],
+    block_ptr: NDArray[np.int64],
+    sums: NDArray[np.float64 | np.int64],
+    nnz: NDArray[np.int64],
+) -> None:
+    """:func:`agg_sum_csr`'s arithmetic, and the count of non-zeros, parallel over (column block, group) pairs.
+
+    Each sum adds the group's values in row order into the `sums` dtype, as :func:`agg_sum_csr` does,
+    so it is bit-identical to it. `indices` must be sorted.
+    """
+    n_groups = group_ptr.shape[0] - 1
+    for t in numba.prange((block_ptr.shape[0] - 1) * n_groups):
+        b, g = t // n_groups, t % n_groups
+        j0, j1 = block_ptr[b], block_ptr[b + 1]
+        for p in range(group_ptr[g], group_ptr[g + 1]):
+            r = rows[p]
+            start, end = indptr[r], indptr[r + 1]
+            k = start + np.searchsorted(indices[start:end], j0)
+            while k < end:
+                col = indices[k]
+                if col >= j1:
+                    break
+                sums[g, col] += data[k]
+                nnz[g, col] += data[k] != 0
+                k += 1
+
+
+def _group_layout(
+    codes: NDArray[np.integer], n_groups: int
+) -> tuple[NDArray[np.intp], NDArray[np.int64], NDArray[np.int64]]:
+    """Rows grouped by `codes` in stable order (negative codes dropped), group offsets and sizes.
+
+    The rows of each group are in ascending order, as in :func:`~scanpy.get._aggregated.sparse_indicator`.
+    """
+    counts = np.bincount(codes[codes >= 0], minlength=n_groups)
+    rows = np.argsort(codes, kind="stable")[np.count_nonzero(codes < 0) :]
+    return rows, np.concatenate([[0], np.cumsum(counts)]), counts
+
+
+def _scale_dof(
+    var: NDArray[np.float64], counts: NDArray[np.integer], dof: int
+) -> NDArray[np.bool]:
+    """Turn biased per-group variances `var` into `dof`-corrected ones in place.
+
+    Returns which groups have too few observations (their variance becomes NaN).
+    """
+    denom = np.where(counts > dof, counts - dof, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        var *= (counts / denom)[:, None]
+    return np.isnan(denom)
+
+
+def _warn_nan_var(groups: list) -> None:
+    """Warn that the variance of `groups` (labels as `aggregate` lists them) is NaN, as `aggregate` does."""
+    msg = f"Group counts matches dof, resulting var for groups {groups} will be nan"
+    warn(msg, RuntimeWarning)
+
+
+def grouped_mean_var(
+    x: CSRBase, rows: NDArray[np.integer], group_ptr: NDArray[np.integer]
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64] | None]:
+    """Per-group mean, biased variance and (if cheap) non-zero count of CSR `x`.
+
+    Group `g` is the rows ``rows[group_ptr[g]:group_ptr[g + 1]]``. Canonical input takes the
+    blocked kernel; otherwise :func:`mean_var_csr`, which treats duplicate entries as observations.
+    """
+    if has_canonical_format(x):
+        return mean_var_csr_blocked(x, rows, group_ptr)
+    shape = np.array([group_ptr.shape[0] - 1, x.shape[0]], dtype=np.int64)
+    indicator = CompressedArrays(group_ptr, rows, np.empty(0), shape)  # data is unused
+    return (*mean_var_csr(indicator, arrays(x)), None)
+
+
+def mean_var_csr_blocked(
+    x: CSRBase,
+    rows: NDArray[np.integer],
+    group_ptr: NDArray[np.integer],
+    *,
+    n_blocks: int | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    """Per-group mean, biased variance and stored-entry count of canonical CSR `x`.
+
+    Group `g` is the rows ``rows[group_ptr[g]:group_ptr[g + 1]]``, i.e. an indicator matrix's
+    `indices` and `indptr`. Bit-identical to :func:`mean_var_csr` for any `n_blocks`.
+    """
+    n_groups, n_genes = group_ptr.shape[0] - 1, x.shape[1]
+    mean = np.zeros((n_groups, n_genes))
+    var = np.zeros((n_groups, n_genes))
+    nnz = np.zeros((n_groups, n_genes), dtype=np.int64)
+    _mean_var_group_blocks(
+        x.indptr,
+        x.indices,
+        x.data,
+        rows.astype(np.int64),
+        group_ptr.astype(np.int64),
+        _chunk_bounds(n_genes, n_blocks or _n_col_blocks(n_groups)),
+        mean,
+        var,
+        nnz,
+    )
+    return mean, var, nnz
+
+
+def sum_csr_blocked(
+    x: CSRBase,
+    rows: NDArray[np.integer],
+    group_ptr: NDArray[np.integer],
+    *,
+    n_blocks: int | None = None,
+) -> tuple[NDArray[np.float64 | np.int64], NDArray[np.int64]]:
+    """Per-group sum (int64 for integer `x`, else float64) and non-zero count of canonical CSR `x`.
+
+    Groups as in :func:`mean_var_csr_blocked`. Bit-identical to :func:`agg_sum_csr` (what
+    :meth:`~scanpy.get._aggregated.Aggregate.sum` uses) for any `n_blocks`.
+    """
+    n_groups, n_genes = group_ptr.shape[0] - 1, x.shape[1]
+    # as `Aggregate._sum`
+    dtype = np.int64 if np.issubdtype(x.dtype, np.integer) else np.float64
+    sums = np.zeros((n_groups, n_genes), dtype=dtype)
+    nnz = np.zeros((n_groups, n_genes), dtype=np.int64)
+    _sum_group_blocks(
+        x.indptr,
+        x.indices,
+        x.data,
+        rows.astype(np.int64),
+        group_ptr.astype(np.int64),
+        _chunk_bounds(n_genes, n_blocks or _n_col_blocks(n_groups)),
+        sums,
+        nnz,
+    )
+    return sums, nnz

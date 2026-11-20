@@ -347,6 +347,17 @@ def test_scale():
     assert_allclose(v.X.mean(axis=0), np.zeros(v.shape[1]), atol=0.00001)
 
 
+def test_scale_csc_leaves_input() -> None:
+    """`scale` writes CSC results to new data, as before: the input and what shares its buffers keep their values."""
+    x = sparse.random(50, 20, density=0.3, format="csc", dtype=np.float64, rng=0)
+    sibling = sparse.csc_matrix((x.data, x.indices, x.indptr), shape=x.shape)  # noqa: TID251
+    before = x.toarray()
+    res = sc.pp.scale(x, zero_center=False)
+    np.testing.assert_array_equal(x.toarray(), before)
+    np.testing.assert_array_equal(sibling.toarray(), before)
+    assert_allclose(res.toarray(), before / np.std(before, axis=0, ddof=1), rtol=1e-12)
+
+
 def test_scale_rep(*, count_matrix_format: _MatrixFormat, zero_center: bool) -> None:
     """Test that it doesn't matter where the array being scaled is in the anndata object."""
     x = count_matrix_format(sparse.random(100, 200, density=0.3).toarray())
@@ -754,6 +765,33 @@ def test_filter_cells(array_type, arg: str) -> None:
     adata_casted.X = conv.to_dense(adata_casted.X, to_cpu_memory=True)
     adata.X = conv.to_dense(adata.X)
     assert_allclose(adata_casted.X, adata.X, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("by_name", [False, True], ids=["array", "obs_column"])
+def test_filter_cells_mask(*, by_name: bool) -> None:
+    from inspect import signature
+
+    adata = pbmc68k_reduced()
+    adata.X = adata.raw.X.copy()  # `X` must own its buffers to be compacted
+    keep = np.random.default_rng(0).random(adata.n_obs) > 0.3
+    adata.obs["keep"] = keep
+    expected = adata[keep].copy()
+    copied = sc.pp.filter_cells(adata, mask=keep, copy=True)
+    assert_equal(copied, expected)
+    with pytest.raises(TypeError, match=r"can't be combined with `out`"):
+        sc.pp.filter_cells(adata, mask=keep, out=True)
+    x = adata.X
+    sc.pp.filter_cells(adata, mask="keep" if by_name else keep)
+    assert_equal(adata, expected)
+    # with an anndata that supports it, the CSR `X` is compacted in place, not copied
+    compacts = "compact" in signature(AnnData._inplace_subset_obs).parameters
+    assert (adata.X is x) == compacts
+    with pytest.raises(ValueError, match=r"exactly one"):
+        sc.pp.filter_cells(adata, mask=keep, min_genes=1)
+    with pytest.raises(ValueError, match=r"shape of the mask"):
+        sc.pp.filter_cells(adata, mask=np.ones(3, bool))
+    with pytest.raises(ValueError, match=r"must be boolean"):
+        sc.pp.filter_cells(adata, mask=np.ones(adata.n_obs))
 
 
 @needs.jax

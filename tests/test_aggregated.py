@@ -900,3 +900,61 @@ def test_aggregate_var_group_matches_dof(dof: int) -> None:
             np.testing.assert_equal(
                 var[cat], np.var(x[(obs["group"] == cat).to_numpy()], ddof=dof)
             )
+
+
+@pytest.mark.parametrize("n_blocks", [1, 7, 64])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int64])
+@pytest.mark.parametrize("n_threads", [1, 3, None], ids=["1", "3", "all"])
+def test_blocked_csr_kernels_match_serial(
+    n_blocks: int, dtype: type, n_threads: int | None
+) -> None:
+    """The (gene block, group) kernels are bit-identical to the per-group ones `aggregate` used before."""
+    from scanpy._utils._numba import _numba_thread_limit, arrays
+    from scanpy.get._aggregated import sparse_indicator
+    from scanpy.get._kernels import (
+        _group_layout,
+        agg_sum_csr,
+        mean_var_csr,
+        mean_var_csr_blocked,
+        sum_csr_blocked,
+    )
+
+    rng = np.random.default_rng(0)
+    dense = rng.random((1500, 70))
+    dense[dense < 0.75] = 0
+    dense[:, 5] = 0  # an empty gene
+    x = sparse.csr_matrix((np.log1p(dense * 10) * 7).astype(dtype))  # noqa: TID251
+    # very unequal groups and a singleton; no empty group, as `aggregate` drops those
+    codes = rng.choice([0, 1, 2, 3], size=x.shape[0], p=[0.7, 0.2, 0.09, 0.01])
+    codes[11] = 4
+    indicator = sparse_indicator(
+        pd.Categorical.from_codes(codes, list("abcde"))
+    ).tocsr()
+    ref_sums = np.zeros(
+        (5, x.shape[1]), dtype=np.int64 if dtype is np.int64 else np.float64
+    )
+    agg_sum_csr(arrays(indicator), arrays(x), ref_sums)
+    ref_mean, ref_var = mean_var_csr(arrays(indicator), arrays(x))
+
+    rows, group_ptr, _ = _group_layout(codes, 5)
+    with _numba_thread_limit(n_threads):
+        sums, _ = sum_csr_blocked(x, rows, group_ptr, n_blocks=n_blocks)
+        mean, var, _ = mean_var_csr_blocked(x, rows, group_ptr, n_blocks=n_blocks)
+        agg = sc.get.aggregate(
+            ad.AnnData(
+                x,
+                obs=pd.DataFrame(
+                    {"g": codes.astype(str)}, index=[f"c{i}" for i in range(len(codes))]
+                ),
+            ),
+            by="g",
+            func=["sum", "mean", "var"],
+            dof=0,
+        )
+    for actual, expected in ((sums, ref_sums), (mean, ref_mean), (var, ref_var)):
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    # `aggregate` routes canonical CSR through the blocked kernels
+    np.testing.assert_array_equal(agg.layers["mean"], ref_mean)
+    np.testing.assert_array_equal(agg.layers["var"], ref_var)
+    np.testing.assert_array_equal(agg.layers["sum"], ref_sums)

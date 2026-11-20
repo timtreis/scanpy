@@ -39,6 +39,7 @@ from .._utils import (
     sanitize_anndata,
     view_to_actual,
 )
+from .._utils._numba import all_finite
 from .._utils.random import _accepts_legacy_random_state, _if_legacy_apply_global
 from ..get._out import (
     _dest,
@@ -67,13 +68,14 @@ if TYPE_CHECKING:
 @deprecated_arg(
     "inplace", Deprecation("1.13.0", "Use `out=True` instead of `inplace=False`.")
 )
-def filter_cells(
+def filter_cells(  # noqa: PLR0912
     data: AnnData | CSBase | np.ndarray | DaskArray,
     *,
     min_counts: int | None = None,
     min_genes: int | None = None,
     max_counts: int | None = None,
     max_genes: int | None = None,
+    mask: Mask | None = None,
     out: VecRef | bool = False,
     copy: bool = False,
     # deprecated
@@ -86,7 +88,7 @@ def filter_cells(
     i.e. “unreliable” observations.
 
     Only provide one of the optional parameters `min_counts`, `min_genes`,
-    `max_counts`, `max_genes` per call.
+    `max_counts`, `max_genes`, `mask` per call.
 
     Parameters
     ----------
@@ -101,6 +103,14 @@ def filter_cells(
         Maximum number of counts required for a cell to pass filtering.
     max_genes
         Maximum number of genes expressed required for a cell to pass filtering.
+    mask
+        Boolean mask of the cells to keep, or a reference to one,
+        e.g. the name of a boolean `.obs` column or `A.obs['keep']`
+        (a :class:`~pandas.Series` is taken by position, not aligned to `.obs`).
+        Only for :class:`~anndata.AnnData`, which is subset in place unless `copy=True`.
+        With an anndata version that supports it, a CSR `X` is compacted in place
+        instead of copied: `X` stays the same object,
+        and anything else that refers to the old `X` or its buffers sees the compacted data.
     out
         Where to write the counts per cell (see below), e.g. `A.obs['n_genes']`.
         If :data:`True`, return the mask and counts instead of subsetting `data` and writing them.
@@ -161,14 +171,35 @@ def filter_cells(
     """
     out = _legacy_out(out, "inplace", None if inplace else True)
     n_given_options = sum(
-        option is not None for option in [min_genes, min_counts, max_genes, max_counts]
+        option is not None
+        for option in [min_genes, min_counts, max_genes, max_counts, mask]
     )
     if n_given_options != 1:
         msg = (
             "Provide exactly one of the optional parameters `min_counts`, "
-            "`min_genes`, `max_counts`, `max_genes` per call."
+            "`min_genes`, `max_counts`, `max_genes`, `mask` per call."
         )
         raise ValueError(msg)
+    if mask is not None:
+        if not isinstance(data, AnnData):
+            msg = "`mask` is only supported for AnnData."
+            raise TypeError(msg)
+        if (
+            out is not False
+        ):  # `out=True` (or `inplace=False`) asks for the counts instead
+            msg = "`mask` subsets `data`; it can't be combined with `out` or `inplace=False`."
+            raise TypeError(msg)
+        raise_not_implemented_error_if_backed_type(data.X, "filter_cells")
+        keep = np.asarray(_check_mask(data, mask, "obs"))
+        if copy:
+            return data[keep].copy()
+        from inspect import signature
+
+        if "compact" in signature(AnnData._inplace_subset_obs).parameters:
+            data._inplace_subset_obs(keep, compact=True)
+        else:  # anndata without in-place compaction
+            data._inplace_subset_obs(keep)
+        return None
     if isinstance(data, AnnData):
         raise_not_implemented_error_if_backed_type(data.X, "filter_cells")
         adata = data.copy() if copy else data
@@ -419,9 +450,12 @@ def log1p(
 
 @_log1p.register(CSBase)
 def log1p_sparse(x: CSBase, *, base: Number | None = None, copy: bool = False):
-    x = check_array(
-        x, accept_sparse=("csr", "csc"), dtype=(np.float64, np.float32), copy=copy
-    )
+    fmt = dict(accept_sparse=("csr", "csc"), dtype=(np.float64, np.float32))
+    # sklearn checks finiteness with a serial `np.sum(x.data)`: scan in parallel instead,
+    # and let sklearn raise its error if there is anything to raise about
+    x = check_array(x, **fmt, copy=copy, ensure_all_finite=False)
+    if not all_finite(x.data):
+        check_array(x, **fmt)
     x.data = _log1p(x.data, copy=False, base=base)
     return x
 
@@ -437,10 +471,35 @@ def log1p_array(
         x = x.astype(float) if not np.issubdtype(x.dtype, np.floating) else x.copy()
     elif not (np.issubdtype(x.dtype, np.floating) or np.issubdtype(x.dtype, complex)):
         x = x.astype(float)
+    if isinstance(x, np.ndarray) and x.flags.c_contiguous:
+        _log1p_threaded(x.reshape(-1), None if base is None else np.log(base))
+        return x
     np.log1p(x, out=x)
     if base is not None:
         np.divide(x, np.log(base), out=x)
     return x
+
+
+def _log1p_threaded(x: NDArray, divisor: float | None, chunk: int = 1 << 20) -> None:
+    """In-place `log1p` (divided by `divisor`) in chunks across threads.
+
+    numpy's SIMD ufuncs release the GIL but run on one core, which dominates `log1p`
+    on large sparse data. Uses as many threads as numba, like scanpy's kernels.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    err = np.geterr()  # `np.errstate` is per thread
+
+    def work(start: int) -> None:
+        part = x[start : start + chunk]
+        with np.errstate(**err):
+            np.log1p(part, out=part)
+            if divisor is not None:
+                np.divide(part, divisor, out=part)
+
+    with ThreadPoolExecutor(numba.get_num_threads()) as pool:
+        # consume the iterator to surface exceptions
+        list(pool.map(work, range(0, x.shape[0], chunk)))
 
 
 @_log1p.register(HasArrayNamespace)
